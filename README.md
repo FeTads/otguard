@@ -42,7 +42,7 @@ Se sua VPS tem **1 Gbps** e o ataque é de **5 Gbps**, o tráfego nem chega na V
 Na VPS que roda o servidor de OT (Ubuntu 20.04+ / Debian 11+, com `apt`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FeTads/otguard/main/install.sh | sudo sh
+curl -fsSL https://github.com/FeTads/otguard/releases/latest/download/install.sh | sudo sh
 ```
 
 Quando terminar:
@@ -52,6 +52,33 @@ sudo otguard
 ```
 
 O assistente abre uma tela azul tipo instalador do Ubuntu — 8 perguntas rápidas com sugestões prontas em cada tela. Depois disso o OTGuard inicializa sozinho a cada boot.
+
+### Como funciona a verificação de integridade
+
+A URL acima aponta para o `install.sh` que **vai junto com a última release**. Esse `install.sh` é gerado pelo GitHub Actions e traz **duas camadas de verificação**:
+
+1. **Assinatura GPG** (`.deb.sig`) — chave pública fingerprint `C357 5800 8A4D EB52 EC99  6C78 5A7E 6EAD E40B B4A0` (gravada dentro do próprio `install.sh`). Mesmo se a conta GitHub for comprometida, sem a chave privada o atacante **não consegue assinar** um `.deb` falso — o `install.sh` aborta.
+2. **SHA256 do `.deb`** — gravado dentro do próprio `install.sh`. Defesa redundante caso a primeira camada não esteja disponível (releases antigas, p.ex.).
+
+Você pode verificar manualmente:
+
+```bash
+gpg --import otguard-public.gpg
+gpg --verify otguard_<ver>_all.deb.sig otguard_<ver>_all.deb
+sha256sum -c otguard_<ver>_all.deb.sha256
+```
+
+A chave pública mora em [`otguard-public.gpg`](otguard-public.gpg) na raiz do repo.
+
+### URL alternativa (bootstrap, do main branch)
+
+Se você quiser instalar antes de qualquer release existir, dá pra usar:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FeTads/otguard/main/install.sh | sudo sh
+```
+
+Esse modo cai num caminho "bootstrap": consulta a API do GitHub pela última release, baixa o `.deb.sha256` separadamente e confere. Requer `jq` (instalado automaticamente). É o fallback.
 
 ## Comandos
 

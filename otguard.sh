@@ -244,10 +244,15 @@ Confirmar e instalar?" 20 70 || wt_cancel
 # --------------------------------------------------------------------------
 write_config() {
   mkdir -p "$CONF_DIR"
-  norm=$(( W_PEAK * 18 ))                       # ~18 pkt/s por client botado
-  a_pps=$(( norm * 5 )); [ "$a_pps" -lt 60000 ] && a_pps=60000
-  w_pps=$(( norm * 3 )); [ "$w_pps" -lt 25000 ] && w_pps=25000
-  pps_lim=$(( norm * 4 )); [ "$pps_lim" -lt 35000 ] && pps_lim=35000
+  # calibragem: assume ~50 pkt/s por player (Tibia PvP/PvM ativo).
+  # Validado em campo: server de 630 players ~25k pps reais; players*50 ~= 31500.
+  norm=$(( W_PEAK * 50 ))                       # trafego "normal de pico" estimado
+  # WARNING: 2x normal — algo subindo, fica de olho
+  w_pps=$(( norm * 2 ));   [ "$w_pps"   -lt 5000  ] && w_pps=5000
+  # ATTACK: 4x normal — quase certeza de flood
+  a_pps=$(( norm * 4 ));   [ "$a_pps"   -lt 15000 ] && a_pps=15000
+  # captura (watch.sh dispara pcap): 3x normal — entre warning e attack
+  pps_lim=$(( norm * 3 )); [ "$pps_lim" -lt 10000 ] && pps_lim=10000
   ( umask 077; cat > "$CONF" <<OTG_CONF
 # OTGuard $OTG_VER — gerado em $(date -Is)
 IFACE=$W_IFACE

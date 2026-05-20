@@ -4,8 +4,11 @@ name: Build & Release .deb
 #   git tag v1.0
 #   git push origin v1.0
 #
-# Resultado: uma GitHub Release nova com o .deb anexado, baixavel
-# pelo install.sh.
+# Resultado: uma GitHub Release nova com 4 artefatos anexados:
+#   - otguard_<ver>_all.deb          (o pacote)
+#   - otguard_<ver>_all.deb.sha256   (hash do .deb)
+#   - otguard_<ver>_all.deb.sig      (assinatura GPG destacada)
+#   - install.sh                     (instalador com hash + verificacao GPG)
 
 on:
   push:
@@ -34,28 +37,100 @@ jobs:
           sh -n otguard.sh
           sh otguard.sh --selftest
 
-      - name: Constroi o .deb
-        run: sh otguard.sh --build-deb "${{ steps.ver.outputs.version }}"
+      - name: Constroi o .deb, o .sha256 e o install.sh versionado
+        run: |
+          set -e
+          V="${{ steps.ver.outputs.version }}"
 
-      - name: Lista artefatos
-        run: ls -lh otguard_*.deb
+          # 1. gera o .deb
+          sh otguard.sh --build-deb "$V"
+          DEB="otguard_${V}_all.deb"
+          test -f "$DEB" || { echo ".deb nao foi gerado"; exit 1; }
 
-      - name: Cria a Release e anexa o .deb
+          # 2. gera o .sha256 (formato "<hash>  <filename>")
+          sha256sum "$DEB" > "${DEB}.sha256"
+          HASH=$(awk '{print $1}' "${DEB}.sha256")
+          echo "hash: $HASH"
+
+          # 3. gera o install.sh versionado a partir do template do repo,
+          #    substituindo os placeholders __VERSION__ e __SHA256__
+          mkdir -p release-out
+          cp "$DEB" "${DEB}.sha256" release-out/
+          sed -e "s|__VERSION__|${V}|g" \
+              -e "s|__SHA256__|${HASH}|g" \
+              install.sh > release-out/install.sh
+          chmod +x release-out/install.sh
+
+          # sanity: garante que os placeholders sumiram
+          if grep -qE '__VERSION__|__SHA256__' release-out/install.sh; then
+            echo "ERRO: placeholders nao substituidos no install.sh"
+            exit 1
+          fi
+
+          echo "=== conteudo de release-out/ (antes da assinatura) ==="
+          ls -lh release-out/
+
+      - name: Importa a chave GPG privada (do Secret)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -e
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "=== chaves importadas ==="
+          gpg --list-secret-keys --keyid-format LONG
+          # sanity: confirma que a chave eh a esperada (mesma do otguard-public.gpg do repo)
+          EXP=$(gpg --show-keys --with-colons otguard-public.gpg | awk -F: '$1=="fpr"{print $10; exit}')
+          GOT=$(gpg --list-secret-keys --with-colons | awk -F: '$1=="fpr"{print $10; exit}')
+          if [ "$EXP" != "$GOT" ]; then
+            echo "ERRO: fingerprint do Secret nao bate com otguard-public.gpg do repo"
+            echo "  esperado: $EXP"
+            echo "  obtido:   $GOT"
+            exit 1
+          fi
+          echo "fingerprint OK: $GOT"
+
+      - name: Assina o .deb com GPG (assinatura destacada)
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -e
+          cd release-out
+          DEB=$(ls otguard_*.deb)
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 \
+            --detach-sign --armor \
+            --output "${DEB}.sig" \
+            "$DEB"
+          echo "=== release-out apos assinatura ==="
+          ls -lh
+          # sanity: verifica a assinatura recem-criada
+          gpg --batch --verify "${DEB}.sig" "$DEB"
+          echo "assinatura GPG valida."
+
+      - name: Cria a Release e anexa os 4 artefatos
         uses: softprops/action-gh-release@v2
         with:
           name: OTGuard ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: otguard_*.deb
+          files: release-out/*
           body: |
-            **Instalacao one-liner:**
+            ## Instalacao (uma linha, com verificacao de SHA256)
+
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo sh
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh
             ```
 
-            **Instalacao manual:**
+            > Este `install.sh` tem o SHA256 do `.deb` desta release **gravado dentro dele**. Ele baixa o `.deb`, confere o hash, e so instala se bater. Nao precisa de `jq`.
+
+            ## Instalacao manual
+
             ```bash
             wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/otguard_${{ steps.ver.outputs.version }}_all.deb
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/otguard_${{ steps.ver.outputs.version }}_all.deb.sha256
+            sha256sum -c otguard_${{ steps.ver.outputs.version }}_all.deb.sha256
             sudo apt install ./otguard_${{ steps.ver.outputs.version }}_all.deb
             sudo otguard
             ```
