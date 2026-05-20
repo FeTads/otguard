@@ -1,0 +1,61 @@
+name: Build & Release .deb
+
+# Dispara quando voce empurra uma tag tipo v1.0, v1.1, etc.
+#   git tag v1.0
+#   git push origin v1.0
+#
+# Resultado: uma GitHub Release nova com o .deb anexado, baixavel
+# pelo install.sh.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # necessario p/ criar a release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extrai versao da tag (v1.0 -> 1.0)
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Valida o script (sintaxe + selftest)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq whiptail ipset tcpdump iptables curl gawk
+          sh -n otguard.sh
+          sh otguard.sh --selftest
+
+      - name: Constroi o .deb
+        run: sh otguard.sh --build-deb "${{ steps.ver.outputs.version }}"
+
+      - name: Lista artefatos
+        run: ls -lh otguard_*.deb
+
+      - name: Cria a Release e anexa o .deb
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OTGuard ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: otguard_*.deb
+          body: |
+            **Instalacao one-liner:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo sh
+            ```
+
+            **Instalacao manual:**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/otguard_${{ steps.ver.outputs.version }}_all.deb
+            sudo apt install ./otguard_${{ steps.ver.outputs.version }}_all.deb
+            sudo otguard
+            ```

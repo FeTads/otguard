@@ -1,0 +1,10 @@
+# builds locais
+otguard_*.deb
+*.deb.tmp
+
+# editores
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
