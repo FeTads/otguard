@@ -28,7 +28,7 @@
 #
 #  Dica: digite "ot" e TAB para autocompletar (otguard / otguard-mon).
 # ==========================================================================
-OTG_VER=1.5
+OTG_VER=1.6
 CONF_DIR=/etc/otguard
 CONF=$CONF_DIR/otguard.conf
 LOGDIR=/var/log/otguard
@@ -287,6 +287,13 @@ write_config() {
   # Burst: chars_per_ip * 3 (margem p/ login em rajada de todos os chars de uma vez).
   syn_p_rate=$(( W_CHARS_PER_IP * 10 ));  [ "$syn_p_rate"  -lt 30 ] && syn_p_rate=30
   syn_p_burst=$(( W_CHARS_PER_IP * 3 ));  [ "$syn_p_burst" -lt 20 ] && syn_p_burst=20
+  # cores do monitor (em /s, batendo com os limites reais):
+  #  A_SYN_RECV = SGR  -> recv/s atingiu o teto da rate-limit (a partir daqui ja dropa)
+  #  A_SYN      = SGR  -> drops/s sustained ~ SGR ja dispara SYN_LIMIT em 1 janela
+  a_syn_recv=$syn_g_rate;  w_syn_recv=$(( a_syn_recv / 10 )); [ "$w_syn_recv" -lt 5 ] && w_syn_recv=5
+  a_syn=$syn_g_rate;       w_syn=$(( a_syn / 10 ));           [ "$w_syn"      -lt 5 ] && w_syn=5
+  # SYN_LIMIT (drops/janela 10s) = SGR sustentado por uma janela inteira => trigger
+  syn_lim=$(( syn_g_rate * 10 ))
   ( umask 077; cat > "$CONF" <<OTG_CONF
 # OTGuard $OTG_VER — gerado em $(date -Is)
 IFACE=$W_IFACE
@@ -315,6 +322,43 @@ SYN_PER_IP_BURST=$syn_p_burst
 PKT_PER_IP_RATE=1500
 PKT_PER_IP_BURST=2500
 BAN_SECS=3600
+# === SLOWREAD KILLER (otguard-slowread.service) — v2 janela rolante ===
+SLOWREAD_INTERVAL=15
+SLOWREAD_MIN_CONNS=8
+SLOWREAD_TOTAL_SENDQ=800
+# v2 elimina o bug do oscilador (v1 deletava seen ao perder hit): agora conta
+# hits na janela. >= SLOWREAD_BAN_HITS dentro de SLOWREAD_HITS_WINDOW = ban.
+SLOWREAD_HITS_WINDOW=1800
+SLOWREAD_BAN_HITS=3
+SLOWREAD_BAN_SECS=86400
+SLOWREAD_LOG_ONLY=nao
+# === SHADOW (otguard-shadow.service) — ShieldM-local via auth.log ===
+# Requer hook em login.lua escrevendo em /var/log/otguard/auth.log
+# (formato tab: ts ip name accid level voc os). Sem hook = daemon inerte.
+SHADOW_INTERVAL=60
+SHADOW_WINDOW=3600
+SHADOW_A_IPS_PER_CHAR=5
+SHADOW_A_HIGH_LVL=300
+SHADOW_A_LOW_LVL=50
+SHADOW_B_CHARS_PER_IP=5
+SHADOW_B_LEVEL_MAX=20
+SHADOW_SAFE_HIGH_LVL=50
+SHADOW_DB_HIGH_LVL=100
+SHADOW_BAN_SECS=86400
+# === UNBAN (otguard-unban.service) — self-service via accountmanagement.php ===
+# Player loga no site, ve seus IPs banidos, clica "solicitar desban" -> insere
+# em otguard_unban_requests. Daemon polla a cada UNBAN_INTERVAL e processa.
+# Rate limit por account previne abuso por bot.
+UNBAN_INTERVAL=30
+UNBAN_MAX_PER_HOUR=1
+UNBAN_MAX_PER_DAY=5
+# Caminho do config.lua do TFS (deixa vazio pra autodetectar /home/otserv/*/config.lua).
+OTG_TFS_CONFIG=
+# === PANIC MODE (otguard-live.sh) ===
+PPS_PANIC=180000
+PANIC_TRIGGER_SECS=3
+PANIC_HOLD_SECS=15
+PANIC_HYSTERESIS_PCT=50
 # auto-lockdown quando watch dispara ataque: pausa novos logins por LOCKDOWN_SECS
 # (players ESTABLISHED nao sao afetados — sobem pela regra ctstate ACCEPT)
 AUTO_LOCKDOWN=sim
@@ -322,7 +366,7 @@ LOCKDOWN_SECS=300
 # captura + alerta (watch.sh)
 PPS_LIMIT=$pps_lim
 CT_LIMIT=$ct_lim
-SYN_LIMIT=300
+SYN_LIMIT=$syn_lim
 NEED_HITS=2
 COOLDOWN=900
 PCAP_MAX=100000
@@ -336,8 +380,10 @@ A_PPS=$a_pps
 W_PPS=$w_pps
 A_CT=$a_ct
 W_CT=$w_ct
-A_SYN=400
-W_SYN=40
+A_SYN=$a_syn
+W_SYN=$w_syn
+A_SYN_RECV=$a_syn_recv
+W_SYN_RECV=$w_syn_recv
 A_HO=300
 W_HO=50
 OTG_CONF
@@ -357,9 +403,24 @@ IFACE=${IFACE:-eth0}; PORTS_CSV=${PORTS_CSV:-7171,7172}
 BL=/etc/otguard/blocklist.ipset
 if [ -f "$BL" ]; then ipset restore -exist -file "$BL"
 else ipset create -exist otguard_bl hash:ip timeout 86400 maxelem 262144; fi
+# Preserva estado do panic (se estava ativo) — flush apaga, vamos recriar abaixo
+PANIC_WAS_ACTIVE=0
+iptables -t raw -C PREROUTING -p tcp --syn -m multiport --dports "$PORTS_CSV" \
+  -m comment --comment "otg_panic" -j DROP 2>/dev/null && PANIC_WAS_ACTIVE=1
 iptables -t raw -F PREROUTING
 # loopback sempre bypass: senao curl/healthcheck/self-call do nginx/php travam
 iptables -t raw -A PREROUTING -i lo -j ACCEPT
+# Counter de SYNs recebidos nas portas do jogo. Chain vazia: --jump cai nela,
+# incrementa o contador da regra e volta (chain vazia -> RETURN implicito).
+# Usado por otguard-live pra reportar SYN recv/s no monitor.
+iptables -t raw -N otg_syn_recv 2>/dev/null || true
+iptables -t raw -F otg_syn_recv
+iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn \
+  -m comment --comment "otg_syn_recv" -j otg_syn_recv
+# Se panic estava ativo antes do flush, restaurar (otguard-live vai eventualmente
+# reativar tambem, mas evita janela de "descoberto").
+[ "$PANIC_WAS_ACTIVE" = 1 ] && iptables -t raw -A PREROUTING -p tcp --syn \
+  -m multiport --dports "$PORTS_CSV" -m comment --comment "otg_panic" -j DROP
 # whitelist dinamica de players: marca IPs com conexao ESTABLISHED no recent list "otg_players"
 # (timeout via xt_recent). Usado por otguard-lockdown pra nao dropar quem ja jogou recentemente.
 # Idempotente: -C primeiro, so insere se nao existir.
@@ -370,17 +431,24 @@ for a in $ADMIN_IPS; do
 done
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" -m set --match-set otguard_bl src -j DROP
 iptables -t raw -A PREROUTING -p udp -m multiport --dports "$PORTS_CSV" -j DROP
+# Anti-spoof: SYN com source port reservada (80/443/53/25/22) indo pras portas do jogo
+# eh spoofing claro — portas <1024 sao reservadas pra servicos, nao pra clientes
+# random gerando conexoes outbound. Esses ataques sao comuns com SPORT=80.
+for SPF in 80 443 53 25 22 21 3306; do
+  iptables -t raw -A PREROUTING -p tcp --sport "$SPF" --syn -m multiport --dports "$PORTS_CSV" -j DROP
+done
 # limites SYN — calculados em write_config a partir de PEAK_PLAYERS e CHARS_PER_IP
 SGR=${SYN_GLOBAL_RATE:-150};  SGB=${SYN_GLOBAL_BURST:-300}
 SPR=${SYN_PER_IP_RATE:-30};   SPB=${SYN_PER_IP_BURST:-40}
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m hashlimit \
-  --hashlimit-name otg_g --hashlimit-mode dstport --hashlimit-above "${SGR}/sec" --hashlimit-burst "$SGB" -j DROP
+  --hashlimit-name otg_g --hashlimit-mode dstport --hashlimit-above "${SGR}/sec" --hashlimit-burst "$SGB" \
+  -m comment --comment "otg_syn_drop_global" -j DROP
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m hashlimit \
-  --hashlimit-name otg_s --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above "${SPR}/min" --hashlimit-burst "$SPB" -j DROP
-# data-flood por IP (apos handshake): IP que excede PKT_PER_IP_RATE pps -> auto-ban no
-# otguard_bl por BAN_SECS. Proximos pacotes dele caem na regra DROP otguard_bl acima
-# (O(1), antes do conntrack). Pega flood PSH/ACK que vaza por ctstate ESTABLISHED.
-PPR=${PKT_PER_IP_RATE:-1500}; PPB=${PKT_PER_IP_BURST:-2500}; BS=${BAN_SECS:-3600}
+  --hashlimit-name otg_s --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above "${SPR}/min" --hashlimit-burst "$SPB" \
+  -m comment --comment "otg_syn_drop_perip" -j DROP
+# data-flood por IP: IP que excede PKT_PER_IP_RATE pps -> auto-ban no otguard_bl por BAN_SECS.
+# Proximos pacotes dele caem na regra DROP otguard_bl acima (O(1), antes do conntrack).
+PPR=${PKT_PER_IP_RATE:-500}; PPB=${PKT_PER_IP_BURST:-1000}; BS=${BAN_SECS:-3600}
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" -m hashlimit \
   --hashlimit-name otg_pkt --hashlimit-mode srcip --hashlimit-srcmask 32 \
   --hashlimit-above "${PPR}/sec" --hashlimit-burst "$PPB" \
@@ -472,7 +540,7 @@ logger -t otguard-watch "armado: pps>$PPS_LIMIT ct>$CT_LIMIT syn>$SYN_LIMIT"
 free_mb() { df -P / | awk 'NR==2{print int($4/1024)}'; }
 dir_mb()  { du -sm "$OUTDIR" 2>/dev/null | awk '{print $1}'; }
 ct_now()  { cat "$CT_COUNT" 2>/dev/null || echo 0; }
-syn_now() { iptables -t raw -L PREROUTING -n -v -x 2>/dev/null | awk '/150\/sec/{print $1; exit}'; }
+syn_now() { iptables -t raw -L PREROUTING -n -v -x 2>/dev/null | awk '/otg_syn_drop_global/{print $1; exit}'; }
 
 discord_send() {
   [ -z "$DISCORD_WEBHOOK" ] && { logger -t otguard-watch "Discord nao configurado"; return 1; }
@@ -501,7 +569,7 @@ capture() {
   ts=$(date +%Y%m%d-%H%M%S)
   rep="$OUTDIR/report-$ts.txt"; pcap="$OUTDIR/capture-$ts.pcap"; csv="$OUTDIR/pps-$ts.csv"
   logger -t otguard-watch "ATAQUE ($cr) -> capturando em $OUTDIR"
-  # auto-lockdown: pausa NOVAS conexoes em PORTS durante o ataque
+  # auto-lockdown: pausa NOVAS conexoes em 7171/7172 durante o ataque
   # (players ja ESTABLISHED seguem normais pela regra ctstate ACCEPT)
   if [ "$AUTO_LOCKDOWN" = sim ] && [ -x /usr/local/sbin/otguard-lockdown ]; then
     /usr/local/sbin/otguard-lockdown on "${LOCKDOWN_SECS:-300}" >/dev/null 2>&1 \
@@ -594,26 +662,63 @@ RXB=/sys/class/net/$IFACE/statistics/rx_bytes
 CT=/proc/sys/net/netfilter/nf_conntrack_count
 A_PPS=${A_PPS:-60000}; W_PPS=${W_PPS:-25000}
 A_SYN=${A_SYN:-400};   W_SYN=${W_SYN:-40}
+A_SYN_RECV=${A_SYN_RECV:-150}; W_SYN_RECV=${W_SYN_RECV:-15}
 A_CT=${A_CT:-40000};   W_CT=${W_CT:-8000}
 A_HO=${A_HO:-300};     W_HO=${W_HO:-50}
+# --- PANIC: stop responding mode ---
+PPS_PANIC=${PPS_PANIC:-180000}
+PANIC_TRIGGER_SECS=${PANIC_TRIGGER_SECS:-3}
+PANIC_HOLD_SECS=${PANIC_HOLD_SECS:-15}
+PANIC_HYSTERESIS_PCT=${PANIC_HYSTERESIS_PCT:-50}
+PANIC_LOW=$(( PPS_PANIC * PANIC_HYSTERESIS_PCT / 100 ))
 mkdir -p "$(dirname "$LOG")"; : >> "$LOG"
-syn_now() { iptables -w 2 -t raw -L PREROUTING -n -v -x 2>/dev/null | awk '/150\/sec/{print $1; exit}'; }
-p_prev=''; b_prev=''; s_prev=''; tick=0
+syn_now() { iptables -w 2 -t raw -L PREROUTING -n -v -x 2>/dev/null | awk '/otg_syn_drop_global/{print $1; exit}'; }
+syn_recv_now() { iptables -w 2 -t raw -L PREROUTING -n -v -x 2>/dev/null | awk '/otg_syn_recv/{print $1; exit}'; }
+panic_active() { iptables -w 2 -t raw -C PREROUTING -p tcp --syn -m multiport --dports "${PORTS_CSV:-7171,7172}" -m comment --comment "otg_panic" -j DROP 2>/dev/null; }
+panic_on()  { [ -x /usr/local/sbin/otguard-panic ] && /usr/local/sbin/otguard-panic on  >/dev/null 2>&1 && logger -t otguard-live "PANIC ATIVADO (pps>=$PPS_PANIC)"; }
+panic_off() { [ -x /usr/local/sbin/otguard-panic ] && /usr/local/sbin/otguard-panic off >/dev/null 2>&1 && logger -t otguard-live "PANIC DESATIVADO (pps voltou a normal por ${PANIC_HOLD_SECS}s)"; }
+p_prev=''; b_prev=''; s_prev=''; sr_prev=''; tick=0
+high_count=0; low_count=0
 while :; do
   p=$(cat "$RXP" 2>/dev/null || echo 0); b=$(cat "$RXB" 2>/dev/null || echo 0)
   s=$(syn_now); [ -z "$s" ] && s=0
+  sr=$(syn_recv_now); [ -z "$sr" ] && sr=0
   ct=$(cat "$CT" 2>/dev/null || echo 0)
   ho=$(ss -H -tn state syn-recv 2>/dev/null | wc -l)
-  pps=0; mbps=0; sd=0
+  pps=0; mbps=0; sd=0; srecv=0
   [ -n "$p_prev" ] && [ "$p" -ge "$p_prev" ] && pps=$(( (p - p_prev) / INTERVAL ))
   [ -n "$b_prev" ] && [ "$b" -ge "$b_prev" ] && mbps=$(( (b - b_prev) * 8 / 1000000 / INTERVAL ))
   [ -n "$s_prev" ] && [ "$s" -ge "$s_prev" ] && sd=$(( s - s_prev ))
-  p_prev=$p; b_prev=$b; s_prev=$s
+  [ -n "$sr_prev" ] && [ "$sr" -ge "$sr_prev" ] && srecv=$(( sr - sr_prev ))
+  p_prev=$p; b_prev=$b; s_prev=$s; sr_prev=$sr
+  # --- PANIC: state machine ---
+  # ON: pps >= PPS_PANIC por PANIC_TRIGGER_SECS amostras seguidas
+  # OFF: pps <  PANIC_LOW por PANIC_HOLD_SECS amostras seguidas
+  if panic_active; then
+    if [ "$pps" -lt "$PANIC_LOW" ]; then
+      low_count=$(( low_count + 1 ))
+      if [ "$low_count" -ge "$PANIC_HOLD_SECS" ]; then
+        panic_off; low_count=0; high_count=0
+      fi
+    else
+      low_count=0
+    fi
+  else
+    if [ "$pps" -ge "$PPS_PANIC" ]; then
+      high_count=$(( high_count + 1 ))
+      if [ "$high_count" -ge "$PANIC_TRIGGER_SECS" ]; then
+        panic_on; high_count=0; low_count=0
+      fi
+    else
+      high_count=0
+    fi
+  fi
   st=OK
   { [ "$pps" -ge "$W_PPS" ] || [ "$sd" -ge "$W_SYN" ] || [ "$ct" -ge "$W_CT" ] || [ "$ho" -ge "$W_HO" ]; } && st=ALERTA
   { [ "$pps" -ge "$A_PPS" ] || [ "$sd" -ge "$A_SYN" ] || [ "$ct" -ge "$A_CT" ] || [ "$ho" -ge "$A_HO" ]; } && st=ATAQUE
-  printf '%-8s %10s %8s %11s %11s %11s  %s\n' \
-    "$(date +%H:%M:%S)" "$pps" "$mbps" "$ct" "$sd" "$ho" "$st" >> "$LOG"
+  panic_active && st="${st}+PANIC"
+  printf '%-8s %10s %8s %11s %11s %11s %11s  %s\n' \
+    "$(date +%H:%M:%S)" "$pps" "$mbps" "$ct" "$sd" "$srecv" "$ho" "$st" >> "$LOG"
   tick=$(( tick + 1 ))
   if [ "$tick" -ge 120 ]; then
     tick=0
@@ -625,23 +730,37 @@ OTG_LIVE
 
   cat > "$bd/otguard-mon" <<'OTG_MON'
 #!/bin/bash
-# OTGuard — painel ao vivo.  [w] envia snapshot ao Discord   [q] sai
+# OTGuard — painel ao vivo + controles dinamicos
+#
+# Teclas:
+#   [w] envia snapshot ao Discord       [q] sai
+#   [p] toggle PANIC manual              [l] toggle LOCKDOWN manual
+#   [s] toggle SLOWREAD_LOG_ONLY         [a] toggle AUTO_LOCKDOWN
+#   [b] banlist (visualiza)              [u] unban (prompt IP)
+#   [e] edit config (nano /etc/otguard/otguard.conf + reload)
+#   [r] reload (reaplica otguard-mitigacao + restart daemons)
+#   [5] auth-check (panel: padroes A/B + cobertura via auth.log)
+#   [6] sweep full (audit 24h + cross-ban + alerta Discord agregado)
+#
 LOG=/var/log/otguard/live.log
 CONF=/etc/otguard/otguard.conf
 [ -f "$CONF" ] && . "$CONF"
 A_PPS=${A_PPS:-60000}; W_PPS=${W_PPS:-25000}
 A_SYN=${A_SYN:-400};   W_SYN=${W_SYN:-40}
+A_SYN_RECV=${A_SYN_RECV:-150}; W_SYN_RECV=${W_SYN_RECV:-15}
 A_CT=${A_CT:-40000};   W_CT=${W_CT:-8000}
 A_HO=${A_HO:-300};     W_HO=${W_HO:-50}
 IP=$(ip -4 -o addr show "${IFACE:-eth0}" 2>/dev/null | awk '{print $4}')
 SPARK_N=50; peak=0; SENT=""; sent_at=-10
+LAST_ACTION=""; action_at=-10
 [ -t 0 ] && INTERACTIVE=1
-BORD='\033[90m'; TITLE='\033[1;36m'; DIM='\033[2m'; SPK='\033[36m'; RST='\033[0m'
+BORD=$'\033[90m'; TITLE=$'\033[1;36m'; DIM=$'\033[2m'; SPK=$'\033[36m'
+RST=$'\033[0m'; OK_C=$'\033[1;32m'; ALERT_C=$'\033[1;33m'; ERR_C=$'\033[1;31m'
 cleanup() { printf '\033[?25h\033[0m\n'; exit 0; }
 trap cleanup INT TERM
 hrule() { _h=''; _n=$2; while [ "$_n" -gt 0 ]; do _h="$_h$1"; _n=$((_n-1)); done; printf '%s' "$_h"; }
 bar() {
-  bv=$1; bw=$2; ba=$3; bwidth=32
+  bv=$1; bw=$2; ba=$3; bwidth=28
   case $bv in *[!0-9]*|'') bv=0;; esac
   bfill=$(( bv * bwidth / ba )); [ "$bfill" -gt "$bwidth" ] && bfill=$bwidth
   if   [ "$bv" -ge "$ba" ]; then bc='\033[1;31m'
@@ -654,85 +773,391 @@ bar() {
   done
   printf '%b[%b%s%b%s%b]%b' "$BORD" "$bc" "$bf" "$DIM" "$be" "$BORD" "$RST"
 }
-row() { printf '%b│%b  %s\033[K\033[72G%b│%b\n' "$BORD" "$RST" "$1" "$BORD" "$RST"; }
+row() { printf '%b│%b  %s\033[K\033[78G%b│%b\n' "$BORD" "$RST" "$1" "$BORD" "$RST"; }
+
+# ------- ESTADO DINAMICO -------
+check_panic()   { iptables -w 2 -t raw -C PREROUTING -p tcp --syn -m multiport --dports "${PORTS_CSV:-7171,7172}" -m comment --comment "otg_panic" -j DROP 2>/dev/null && echo ATIVO || echo INATIVO; }
+check_lockdwn() { iptables -w 2 -C ufw-before-input -p tcp -m multiport --dports "${PORTS_CSV:-7171,7172}" --syn -m recent ! --rcheck --seconds "${WHITELIST_SECS:-3600}" --name otg_players --rsource -m comment --comment "otguard-lockdown" -j DROP 2>/dev/null && echo ATIVO || echo INATIVO; }
+get_slowread()  { . "$CONF" 2>/dev/null; if [ "$SLOWREAD_LOG_ONLY" = "sim" ]; then echo "LOG-ONLY"; else echo "BAN-AUTO"; fi; }
+get_autolock()  { . "$CONF" 2>/dev/null; if [ "$AUTO_LOCKDOWN" = "sim" ]; then echo "ON"; else echo "OFF"; fi; }
 check_prot() {
   rawp=$(iptables -w 2 -t raw -S PREROUTING 2>/dev/null)
-  if [ -z "$rawp" ]; then
-    prot=$(printf 'protecao    %b(rode como root para checar as regras)%b' "$DIM" "$RST"); return
-  fi
-  pg='\033[1;32m'; pr='\033[1;31m'
-  case $rawp in *multiport*) fw="${pg}✓${RST}";; *) fw="${pr}✗${RST}";; esac
-  case $rawp in *otg_g*)     fl="${pg}✓${RST}";; *) fl="${pr}✗${RST}";; esac
+  if [ -z "$rawp" ]; then prot="${DIM}(rode como root pra checar regras)${RST}"; return; fi
+  case $rawp in *multiport*) fw="${OK_C}✓${RST}";; *) fw="${ERR_C}✗${RST}";; esac
+  case $rawp in *otg_g*)     fl="${OK_C}✓${RST}";; *) fl="${ERR_C}✗${RST}";; esac
   bn=$(ipset list otguard_bl 2>/dev/null | awk '/Number of entries/{print $4}')
-  if [ -n "$bn" ]; then bs="${pg}✓${RST} ${DIM}${bn} IPs${RST}"; else bs="${pr}✗${RST}"; fi
-  prot=$(printf 'protecao    firewall %b    anti-flood %b    blocklist %b' "$fw" "$fl" "$bs")
+  if [ -n "$bn" ]; then bs="${OK_C}✓${RST} ${DIM}${bn} IPs${RST}"; else bs="${ERR_C}✗${RST}"; fi
+  wn=$(wc -l < /proc/net/xt_recent/otg_players 2>/dev/null || echo 0)
+  prot=$(printf 'firewall %b    anti-flood %b    blocklist %b    whitelist %b%d players%b' "$fw" "$fl" "$bs" "$DIM" "$wn" "$RST")
 }
+config_set() {
+  # config_set KEY VALUE — substitui ou adiciona KEY=VALUE no CONF
+  local key="$1" val="$2"
+  if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$CONF"
+  else
+    echo "${key}=${val}" >> "$CONF"
+  fi
+}
+toast() { LAST_ACTION="$1"; action_at=$SECONDS; }
+
+# ------- ACOES -------
 send_snapshot() {
   local when js
-  if [ -z "$DISCORD_WEBHOOK" ]; then
-    SENT=$(printf '%b' '\033[1;31m✗ webhook nao configurado\033[0m'); sent_at=$SECONDS; return
-  fi
+  if [ -z "$DISCORD_WEBHOOK" ]; then toast "${ERR_C}✗ webhook nao configurado${RST}"; return; fi
   when=$(date '+%d/%m/%Y %H:%M:%S')
-  js=$(printf '{"username":"OTGuard","embeds":[{"title":"📊 Snapshot do monitor","description":"Envio manual do painel ao vivo.","color":3447003,"fields":[{"name":"🎯 Servidor","value":"`%s`","inline":true},{"name":"🕐 Quando","value":"%s","inline":true},{"name":"Estado","value":"**%s**","inline":true},{"name":"📊 Agora","value":"pacotes/s: **%s**  ·  banda: **%s Mb/s**\\nconntrack: **%s**  ·  SYN drop/s: **%s**  ·  half-open: **%s**","inline":false},{"name":"📈 Pico de pkt/s na sessao","value":"%s","inline":false}],"footer":{"text":"enviado manualmente via otguard-mon"}}]}' \
+  js=$(printf '{"username":"OTGuard","embeds":[{"title":"📊 Snapshot do monitor","color":3447003,"fields":[{"name":"🎯 Servidor","value":"`%s`","inline":true},{"name":"🕐 Quando","value":"%s","inline":true},{"name":"Estado","value":"**%s**","inline":true},{"name":"📊 Agora","value":"pps **%s**  ·  banda **%s Mb/s**\\nct **%s**  ·  SYN drop **%s**  ·  HO **%s**","inline":false},{"name":"📈 Pico","value":"%s pps","inline":false}],"footer":{"text":"enviado manualmente"}}]}' \
     "${IP:-?}" "$when" "$est" "$pps" "$mbps" "$ct" "$syn" "$ho" "$peak")
-  if curl -fsS -m 15 -H 'Content-Type: application/json' -X POST -d "$js" "$DISCORD_WEBHOOK" >/dev/null 2>&1; then
-    SENT=$(printf '%b' "\033[1;32m✓ snapshot enviado ao Discord — $(date '+%H:%M:%S')\033[0m")
-  else
-    SENT=$(printf '%b' '\033[1;31m✗ falha ao enviar (curl/webhook)\033[0m')
-  fi
-  sent_at=$SECONDS
+  curl -fsS -m 15 -H 'Content-Type: application/json' -X POST -d "$js" "$DISCORD_WEBHOOK" >/dev/null 2>&1 \
+    && toast "${OK_C}✓ snapshot enviado${RST}" || toast "${ERR_C}✗ falha ao enviar${RST}"
 }
-# OTG_VER e substituido pelo emit_scripts no momento da geracao do .deb / instalacao
-OTG_VER='__OTG_VER__'
-title="OTGuard v${OTG_VER} · monitor de trafego"
-dashes=$(( 67 - ${#title} )); [ "$dashes" -lt 4 ] && dashes=4
+toggle_panic()    { if [ "$(check_panic)" = ATIVO ]; then /usr/local/sbin/otguard-panic off >/dev/null 2>&1; toast "${OK_C}panic OFF${RST}"; else /usr/local/sbin/otguard-panic on >/dev/null 2>&1; toast "${ERR_C}panic ON${RST}"; fi; }
+toggle_lockdown() { if [ "$(check_lockdwn)" = ATIVO ]; then /usr/local/sbin/otguard-lockdown off >/dev/null 2>&1; toast "${OK_C}lockdown OFF${RST}"; else /usr/local/sbin/otguard-lockdown on 600 >/dev/null 2>&1; toast "${ALERT_C}lockdown ON (600s)${RST}"; fi; }
+toggle_slowread() {
+  . "$CONF" 2>/dev/null
+  if [ "$SLOWREAD_LOG_ONLY" = "sim" ]; then
+    config_set SLOWREAD_LOG_ONLY nao; toast "${ERR_C}slowread BAN-AUTO ativado${RST}"
+  else
+    config_set SLOWREAD_LOG_ONLY sim; toast "${OK_C}slowread LOG-ONLY ativado${RST}"
+  fi
+  systemctl restart otguard-slowread >/dev/null 2>&1
+}
+toggle_autolock() {
+  . "$CONF" 2>/dev/null
+  if [ "$AUTO_LOCKDOWN" = "sim" ]; then
+    config_set AUTO_LOCKDOWN nao; toast "${ALERT_C}auto-lockdown OFF${RST}"
+  else
+    config_set AUTO_LOCKDOWN sim; toast "${OK_C}auto-lockdown ON${RST}"
+  fi
+}
+banlist_show() {
+  printf '\033[2J\033[H'
+  echo "─── BANLIST (otguard_bl) ───"
+  ipset list otguard_bl 2>&1 | awk '/^Members:/{p=1;next} p && NF{ip=$1; t=""; for(i=1;i<=NF;i++) if($i=="timeout") t=$(i+1); if(t==""||t==0) lbl="permanente"; else { h=int(t/3600); m=int((t%3600)/60); lbl=sprintf("%dh%02dm restante", h, m) } printf "  %-18s  %s\n", ip, lbl }'
+  echo ""; read -p "[ENTER pra voltar] " _; printf '\033[2J'
+}
+unban_prompt() {
+  printf '\033[2J\033[H'
+  read -p "IP pra desbanir (vazio = cancela): " ip
+  if [ -n "$ip" ]; then
+    if ipset del otguard_bl "$ip" 2>/dev/null; then
+      ipset save otguard_bl > /etc/otguard/blocklist.ipset 2>/dev/null
+      toast "${OK_C}$ip desbanido${RST}"
+    else
+      toast "${ERR_C}$ip nao estava banido${RST}"
+    fi
+  fi
+  printf '\033[2J'
+}
+edit_config() {
+  cleanup_noexit() { printf '\033[?25h'; }
+  cleanup_noexit
+  ${EDITOR:-nano} "$CONF"
+  /usr/local/sbin/otguard-mitigacao.sh >/dev/null 2>&1
+  systemctl restart otguard-live otguard-slowread otguard-watch >/dev/null 2>&1
+  printf '\033[?25l\033[2J'
+  toast "${OK_C}config recarregada${RST}"
+}
+show_help() {
+  local nbl nwl
+  nbl=$(ipset list otguard_bl 2>/dev/null | awk '/Number of entries/{print $4}')
+  nwl=$(wc -l < /proc/net/xt_recent/otg_players 2>/dev/null)
+  printf '\033[?25l\033[2J\033[H\n'
+  printf '  %bOTGuard — ajuda rapida%b\n' "$TITLE" "$RST"
+  printf '  %b=======================================================%b\n\n' "$BORD" "$RST"
+
+  printf '  %b[p] PANIC%b\n' "$TITLE" "$RST"
+  printf '    Modo "fecha tudo". Ninguem novo entra no server.\n'
+  printf '    Quem JA esta jogando continua normal — so os logins\n'
+  printf '    NOVOS sao bloqueados. Liga sozinho quando o trafego\n'
+  printf '    explode (sinal de ataque). Aperta [p] pra forcar.\n\n'
+
+  printf '  %b[l] LOCKDOWN%b\n' "$TITLE" "$RST"
+  printf '    Mais brando que panic: bloqueia logins novos, MAS\n'
+  printf '    deixa passar quem ja jogou aqui na ultima hora\n'
+  printf '    (esses ficam numa whitelist temporaria). Quem cai\n'
+  printf '    consegue reconectar. Bom contra atacante novo que\n'
+  printf '    nunca esteve aqui antes.\n\n'
+
+  printf '  %b[s] SLOWREAD%b\n' "$TITLE" "$RST"
+  printf '    Pega atacante "quieto": aquele que abre varias\n'
+  printf '    conexoes e fica parado pra travar o server (igual\n'
+  printf '    encher fila no Subway sem comprar nada). Hoje so\n'
+  printf '    LOGA suspeitos (nao bane). Aperta [s] pra ele\n'
+  printf '    BANIR sozinho da proxima.\n\n'
+
+  printf '  %b[a] AUTO-LOCK%b\n' "$TITLE" "$RST"
+  printf '    Liga/desliga o LOCKDOWN automatico. ON = o\n'
+  printf '    sistema ativa lockdown sozinho quando detecta\n'
+  printf '    ataque. OFF = so liga se VOCE apertar [l].\n\n'
+
+  printf '  %b[b] BANLIST  [u] UNBAN%b\n' "$TITLE" "$RST"
+  printf '    [b] mostra os IPs banidos (%s agora) com tempo\n' "$nbl"
+  printf '    restante de cada um. [u] te pede um IP pra\n'
+  printf '    desbanir (se um amigo tomou ban sem querer).\n\n'
+
+  printf '  %bWHITELIST (automatica)%b\n' "$TITLE" "$RST"
+  printf '    Toda vez que um jogador conecta, o IP dele entra\n'
+  printf '    numa lista de "amigos" por 1 hora. Hoje tem %s\n' "$nwl"
+  printf '    IPs ai. Eles tem passe livre no lockdown.\n\n'
+
+  printf '  %b[e] EDIT CONF%b\n' "$TITLE" "$RST"
+  printf '    Abre o arquivo de configuracoes pra editar\n'
+  printf '    (limites, thresholds, etc). Quando voce salva e\n'
+  printf '    sai, o sistema aplica tudo sozinho.\n\n'
+
+  printf '  %b[r] RELOAD%b\n' "$TITLE" "$RST"
+  printf '    Reaplica as configuracoes SEM abrir o editor.\n'
+  printf '    Util se voce mexeu no arquivo de outra forma.\n\n'
+
+  printf '  %b[5] AUTH-CHECK%b\n' "$TITLE" "$RST"
+  printf '    Abre painel com auditoria do auth.log: quantos\n'
+  printf '    logins reais autenticaram, cobertura vs conn ESTAB,\n'
+  printf '    distribuicao de level (bot tipico fica em lvl 7-10),\n'
+  printf '    padrao A (char usado de muitos IPs) e padrao B (IP\n'
+  printf '    com muitos chars low-level). Janela 2h.\n\n'
+
+  printf '  %b[6] SWEEP FULL%b\n' "$TITLE" "$RST"
+  printf '    Audit 24h, lista candidatos, pede confirmacao e BANA\n'
+  printf '    em massa todos os IPs casando Padrao A ou B (com\n'
+  printf '    safety: skip se IP tem main lvl>=50 na janela).\n'
+  printf '    Depois manda 1 alerta agregado no Discord.\n\n'
+
+  printf '  %b[w] DISCORD  [q] sair%b\n' "$TITLE" "$RST"
+  printf '    [w] manda um snapshot do painel pro seu Discord.\n'
+  printf '    [q] fecha o monitor.\n\n'
+
+  printf '  %b---%b\n' "$DIM" "$RST"
+  printf '  %bResumo simples: %s%b\n' "$DIM" "PANIC > LOCKDOWN > SLOWREAD" "$RST"
+  printf '  %b(do mais agressivo pro mais cirurgico)%b\n\n' "$DIM" "$RST"
+
+  printf '  %b=======================================================%b\n' "$BORD" "$RST"
+  printf '  %b[ENTER pra voltar ao monitor]%b\n\n' "$DIM" "$RST"
+  read -r _ 2>/dev/null
+  printf '\033[2J'
+}
+reload_all() {
+  /usr/local/sbin/otguard-mitigacao.sh >/dev/null 2>&1
+  systemctl restart otguard-live otguard-slowread otguard-watch otguard-shadow >/dev/null 2>&1
+  toast "${OK_C}daemons reiniciados${RST}"
+}
+
+# [5] painel auth-check: roda otguard-auth-check 7200 e mostra inline
+show_authcheck() {
+  if ! command -v otguard-auth-check >/dev/null 2>&1; then
+    toast "${ERR_C}otguard-auth-check nao instalado${RST}"
+    return
+  fi
+  printf '\033[?25l\033[2J\033[H\n'
+  printf '  %bOTGuard — Auth Check (janela 2h)%b\n' "$TITLE" "$RST"
+  printf '  %b=======================================================%b\n\n' "$BORD" "$RST"
+  otguard-auth-check 7200 2>&1
+  printf '\n  %b=======================================================%b\n' "$BORD" "$RST"
+  printf '  %b[ENTER pra voltar ao monitor]%b\n\n' "$DIM" "$RST"
+  read -r _ 2>/dev/null
+  printf '\033[2J'
+}
+
+# [6] sweep: audit 24h + lista candidatos + confirma + ban cruzado + Discord
+run_sweep() {
+  if [ ! -f /var/log/otguard/auth.log ]; then
+    toast "${ERR_C}/var/log/otguard/auth.log nao existe${RST}"
+    return
+  fi
+  printf '\033[?25l\033[2J\033[H\n'
+  printf '  %bOTGuard — Sweep Full (janela 24h)%b\n' "$TITLE" "$RST"
+  printf '  %b=======================================================%b\n\n' "$BORD" "$RST"
+
+  local now cut tmp
+  now=$(date +%s); cut=$(( now - 86400 ))
+  tmp=$(mktemp -d); trap "rm -rf $tmp" RETURN
+
+  awk -F'\t' -v cut="$cut" '$1>=cut{print $3"\t"$2"\t"$5+0}' /var/log/otguard/auth.log | sort -u | \
+    awk -F'\t' '
+      {cnt[$1]++; if($3+0>max[$1]) max[$1]=$3+0; ips[$1]=(ips[$1]?ips[$1]","$2:$2)}
+      END{for(c in cnt) if(cnt[c]>=5) printf "%s\t%d\t%d\t%s\n", c, cnt[c], max[c], ips[c]}
+    ' | sort -t$'\t' -k2 -rn > "$tmp/A"
+
+  awk -F'\t' -v cut="$cut" '$1>=cut{print $2"\t"$3"\t"$4"\t"$5+0}' /var/log/otguard/auth.log | sort -u > "$tmp/Brows"
+  awk -F'\t' '$4<=20{cnt[$1]++; chars[$1]=(chars[$1]?chars[$1]"|"$2:$2)} END{for(ip in cnt) if(cnt[ip]>=5) printf "%s\t%d\t%s\n", ip, cnt[ip], chars[ip]}' "$tmp/Brows" | \
+  while IFS=$'\t' read -r ip n charlist; do
+    has_high=$(awk -F'\t' -v ip="$ip" '$1==ip && $4>=50' "$tmp/Brows" | wc -l)
+    [ "$has_high" -gt 0 ] && continue
+    printf "%s\t%d\t%s\n" "$ip" "$n" "$charlist"
+  done > "$tmp/B"
+
+  na=$(wc -l < "$tmp/A"); nb=$(wc -l < "$tmp/B")
+  printf '  %bPadrao A%b (char com 5+ IPs em 24h): %s candidatos\n' "$TITLE" "$RST" "$na"
+  if [ "$na" -gt 0 ]; then
+    awk -F'\t' '{printf "    %-30s lvl=%d  ips=%d\n", $1, $3, $2}' "$tmp/A" | head -15
+    [ "$na" -gt 15 ] && printf '    %b...(+%d)%b\n' "$DIM" "$((na-15))" "$RST"
+  fi
+  printf '\n  %bPadrao B%b (IP com 5+ chars lvl<=20 sem main na janela): %s candidatos\n' "$TITLE" "$RST" "$nb"
+  if [ "$nb" -gt 0 ]; then
+    awk -F'\t' '{printf "    %-18s chars=%d\n", $1, $2}' "$tmp/B" | head -15
+    [ "$nb" -gt 15 ] && printf '    %b...(+%d)%b\n' "$DIM" "$((nb-15))" "$RST"
+  fi
+
+  ips_to_ban=$( { awk -F'\t' '{n=split($4,a,",");for(i=1;i<=n;i++) print a[i]}' "$tmp/A"; awk -F'\t' '{print $1}' "$tmp/B"; } | sort -u | grep -E '^[0-9.]+$')
+  total=$(printf '%s\n' "$ips_to_ban" | grep -c .)
+  printf '\n  %bTotal de IPs unicos para banir: %d%b\n' "$TITLE" "$total" "$RST"
+
+  if [ "$total" -eq 0 ]; then
+    printf '\n  %bNada para banir.  [ENTER pra voltar]%b\n' "$DIM" "$RST"
+    read -r _ 2>/dev/null
+    printf '\033[2J'; return
+  fi
+
+  printf '\n  %bConfirma BAN de %d IPs + alerta Discord?  [y/N]:%b ' "$ALERT_C" "$total" "$RST"
+  read -r ans
+  if [ "$ans" != "y" ] && [ "$ans" != "Y" ]; then
+    toast "${DIM}sweep cancelado${RST}"
+    printf '\033[2J'; return
+  fi
+
+  banned=0
+  printf '%s\n' "$ips_to_ban" | while read -r ip; do
+    [ -z "$ip" ] && continue
+    if ! ipset test otguard_bl "$ip" 2>/dev/null; then
+      ipset add -exist otguard_bl "$ip" timeout 86400 2>/dev/null
+      ss -K dst "$ip" >/dev/null 2>&1 || true
+      banned=$((banned+1))
+    fi
+  done
+  ipset save otguard_bl > /etc/otguard/blocklist.ipset 2>/dev/null
+  logger -t otguard-mon "sweep manual: $total IPs banidos (A=$na, B=$nb)"
+
+  if [ -n "$DISCORD_WEBHOOK" ]; then
+    body=$(printf 'Sweep manual via otguard mon\\n**Padrao A:** %d candidatos\\n**Padrao B:** %d candidatos\\n**IPs banidos:** %d (24h)' "$na" "$nb" "$total")
+    payload=$(printf '{"username":"OTGuard Sweep","embeds":[{"title":"🧹 Sweep manual executado","description":"%s","color":15158332}]}' "$body")
+    curl -s -m 5 -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+  fi
+  toast "${OK_C}sweep: $total IPs banidos${RST}"
+  printf '\033[2J'
+}
+
+# ------- LOG BOX -------
+recent_log() {
+  # ultimas 5 linhas RELEVANTES dos daemons (so as vindas via 'logger -t tag',
+  # nao mensagens de systemd como "Started" / "Stopping").
+  # SYSLOG_IDENTIFIER=otguard-* captura todos os tags do projeto.
+  journalctl --no-pager -n 30 -o cat \
+    SYSLOG_IDENTIFIER=otguard-mitigacao \
+    SYSLOG_IDENTIFIER=otguard-watch \
+    SYSLOG_IDENTIFIER=otguard-live \
+    SYSLOG_IDENTIFIER=otguard-slowread \
+    SYSLOG_IDENTIFIER=otguard-panic \
+    SYSLOG_IDENTIFIER=otguard-lockdown \
+    SYSLOG_IDENTIFIER=otguard-shadow \
+    SYSLOG_IDENTIFIER=otguard-unban \
+    SYSLOG_IDENTIFIER=otguard-mon \
+    SYSLOG_IDENTIFIER=otguard-cf 2>/dev/null | \
+    grep -vE '^(Started|Stopping|Stopped|Succeeded|Reloaded|signal process)' | \
+    tail -5 | while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case "$line" in
+        *UNBAN*)                             c="\033[1;36m" ;;
+        *ATIVADO*|*PANIC*|*ATAQUE*|*BANIDO*|*PADRAO_B:*|*PADRAO_A_LOW*) c="\033[1;31m" ;;
+        *PADRAO_A_HIGH*|*PADRAO_A_MID*|*SKIP_safety*|*REJEITADO*|*suspeito*|*armado*|*CANDIDATO*) c="\033[1;33m" ;;
+        *)                                   c="\033[0;37m" ;;
+      esac
+      printf "${c}%.72s${RST}\n" "$line"
+    done
+}
+
+# ------- VERSAO -------
+OTG_VER=__OTG_VER__
+[ "$OTG_VER" = "__OTG_VER__" ] && OTG_VER=1.6
+title="OTGuard v${OTG_VER} · monitor interativo"
+dashes=$(( 73 - ${#title} )); [ "$dashes" -lt 4 ] && dashes=4
 TOP=$(printf '%b┌─ %b%s %b%s┐%b' "$BORD" "$TITLE" "$title" "$BORD" "$(hrule ─ "$dashes")" "$RST")
-SEP=$(printf '%b├%s┤%b' "$BORD" "$(hrule ─ 70)" "$RST")
-BOT=$(printf '%b└%s┘%b' "$BORD" "$(hrule ─ 70)" "$RST")
+SEP=$(printf '%b├%s┤%b' "$BORD" "$(hrule ─ 76)" "$RST")
+BOT=$(printf '%b└%s┘%b' "$BORD" "$(hrule ─ 76)" "$RST")
 printf '\033[2J\033[?25l'
 ptick=0; check_prot
 while :; do
   set -- $(tail -n 1 "$LOG" 2>/dev/null)
-  hora=$1; pps=$2; mbps=$3; ct=$4; syn=$5; ho=$6; est=$7
+  # formato novo (8 cols): hora pps mbps ct syn_drop syn_recv ho est
+  # formato antigo (7 cols): hora pps mbps ct syn_drop ho est — fallback automatico
+  if [ $# -ge 8 ]; then
+    hora=$1; pps=$2; mbps=$3; ct=$4; syn=$5; srecv=$6; ho=$7; est=$8
+  else
+    hora=$1; pps=$2; mbps=$3; ct=$4; syn=$5; srecv=0; ho=$6; est=$7
+  fi
   case $pps in *[!0-9]*|'') pps=0;; esac
+  case $srecv in *[!0-9]*|'') srecv=0;; esac
   case $mbps in *[!0-9]*|'') mbps=0;; esac
   [ "$pps" -gt "$peak" ] && peak=$pps
-  case $est in
-    ATAQUE) badge='\033[1;5;37;41m  ATAQUE  \033[0m'; desc='ataque em andamento';;
-    ALERTA) badge='\033[1;30;43m  ALERTA  \033[0m';   desc='trafego elevado, de olho';;
-    *)      badge='\033[1;30;42m    OK    \033[0m';   desc='trafego normal';;
+  # est pode vir "ATAQUE+PANIC"
+  case "$est" in
+    *ATAQUE*) badge='\033[1;5;37;41m  ATAQUE  \033[0m'; desc="$est";;
+    *ALERTA*) badge='\033[1;30;43m  ALERTA  \033[0m'; desc="$est";;
+    *)        badge='\033[1;30;42m    OK    \033[0m'; desc='trafego normal';;
   esac
+  panic_st=$(check_panic); lock_st=$(check_lockdwn)
+  slow_st=$(get_slowread); auto_st=$(get_autolock)
   spark=$(tail -n "$SPARK_N" "$LOG" 2>/dev/null | awk '
     { v[NR]=$2+0; if(NR==1||v[NR]<mn)mn=v[NR]; if(NR==1||v[NR]>mx)mx=v[NR] }
     END { b[0]="▁";b[1]="▂";b[2]="▃";b[3]="▄";b[4]="▅";b[5]="▆";b[6]="▇";b[7]="█"
           r=mx-mn; if(r<=0)r=1; s=""
           for(i=1;i<=NR;i++){ l=int((v[i]-mn)*7/r); if(l<0)l=0; if(l>7)l=7; s=s b[l] }
           print s }')
-  if [ -n "$SENT" ] && [ $((SECONDS - sent_at)) -lt 6 ]; then foot="$SENT"
-  else foot=$(printf '%b[w]%b enviar snapshot ao Discord     %b[q]%b sair     %batualiza 1x/s%b' "$RST" "$DIM" "$RST" "$DIM" "$DIM" "$RST"); fi
   ptick=$((ptick+1)); [ "$ptick" -ge 15 ] && { ptick=0; check_prot; }
+
+  # Cor pros toggles
+  [ "$panic_st" = ATIVO ]   && pcol="$ERR_C" || pcol="$DIM"
+  [ "$lock_st"  = ATIVO ]   && lcol="$ALERT_C" || lcol="$DIM"
+  [ "$slow_st"  = BAN-AUTO ] && scol="$ALERT_C" || scol="$OK_C"
+  [ "$auto_st"  = ON ]      && acol="$OK_C" || acol="$DIM"
+
   printf '\033[H'
   printf '%s\033[K\n' "$TOP"
-  row "$(printf '%b%-30s%30s%b' "$DIM" "${IP:-?}" "$(date '+%d/%m  %H:%M:%S')" "$RST")"
+  row "$(printf '%b%-30s%36s%b' "$DIM" "${IP:-?}" "$(date '+%d/%m  %H:%M:%S')" "$RST")"
   row ''
-  row "$(printf 'estado   %b   %b%s%b' "$badge" "$DIM" "$desc" "$RST")"
-  row "$prot"
+  row "$(printf 'estado    %b   %b%s%b' "$badge" "$DIM" "$desc" "$RST")"
+  row "$(printf 'protecao  %s' "$prot")"
   row ''
-  row "$(printf '%-11s %s  %7s %b/ %s%b' 'pacotes/s'  "$(bar "$pps" "$W_PPS" "$A_PPS")" "$pps" "$DIM" "$A_PPS" "$RST")"
-  row "$(printf '%-11s %s  %7s %b/ %s%b' 'conntrack'  "$(bar "$ct"  "$W_CT"  "$A_CT")"  "$ct"  "$DIM" "$A_CT"  "$RST")"
-  row "$(printf '%-11s %s  %7s %b/ %s%b' 'SYN drop/s' "$(bar "$syn" "$W_SYN" "$A_SYN")" "$syn" "$DIM" "$A_SYN" "$RST")"
-  row "$(printf '%-11s %s  %7s %b/ %s%b' 'half-open'  "$(bar "$ho"  "$W_HO"  "$A_HO")"  "$ho"  "$DIM" "$A_HO"  "$RST")"
-  row ''
+  row "$(printf '%-11s %s  %7s %b/ %s%b' 'pacotes/s'  "$(bar "$pps"  "$W_PPS"      "$A_PPS")"      "$pps"   "$DIM" "$A_PPS"      "$RST")"
+  row "$(printf '%-11s %s  %7s %b/ %s%b' 'conntrack'  "$(bar "$ct"   "$W_CT"       "$A_CT")"       "$ct"    "$DIM" "$A_CT"       "$RST")"
+  row "$(printf '%-11s %s  %7s %b/ %s%b' 'SYN recv/s' "$(bar "$srecv" "$W_SYN_RECV" "$A_SYN_RECV")" "$srecv" "$DIM" "$A_SYN_RECV" "$RST")"
+  row "$(printf '%-11s %s  %7s %b/ %s%b' 'SYN drop/s' "$(bar "$syn"  "$W_SYN"      "$A_SYN")"      "$syn"   "$DIM" "$A_SYN"      "$RST")"
+  row "$(printf '%-11s %s  %7s %b/ %s%b' 'half-open'  "$(bar "$ho"   "$W_HO"       "$A_HO")"       "$ho"    "$DIM" "$A_HO"       "$RST")"
   row "$(printf '%-11s %b%s%b' 'tendencia' "$SPK" "$spark" "$RST")"
   row ''
   printf '%s\033[K\n' "$SEP"
-  row "$foot"
+  row "$(printf '%bcontroles dinamicos%b' "$TITLE" "$RST")"
+  row "$(printf '  panic      %b%-8s%b [p] toggle    %bauto via pps>=%s%b' "$pcol" "$panic_st" "$RST" "$DIM" "${PPS_PANIC:-180000}" "$RST")"
+  row "$(printf '  lockdown   %b%-8s%b [l] toggle    %bxt_recent whitelist filtra%b' "$lcol" "$lock_st" "$RST" "$DIM" "$RST")"
+  row "$(printf '  slowread   %b%-8s%b [s] toggle    %bbase: %s conn, %sB SQ, %ss%b' "$scol" "$slow_st" "$RST" "$DIM" "${SLOWREAD_MIN_CONNS:-10}" "${SLOWREAD_TOTAL_SENDQ:-800}" "${SLOWREAD_GRACE_SECS:-180}" "$RST")"
+  row "$(printf '  auto-lock  %b%-8s%b [a] toggle    %bwatch dispara lockdown se ataque%b' "$acol" "$auto_st" "$RST" "$DIM" "$RST")"
+  row ''
+  printf '%s\033[K\n' "$SEP"
+  row "$(printf '%blog ao vivo (5 ultimas)%b' "$TITLE" "$RST")"
+  recent_log | while IFS= read -r line; do row "  $line"; done
+  printf '%s\033[K\n' "$SEP"
+  if [ -n "$LAST_ACTION" ] && [ $((SECONDS - action_at)) -lt 5 ]; then
+    row "$LAST_ACTION"
+  else
+    row "$(printf '%b[w]%b discord  %b[p]%b panic  %b[l]%b lockdown  %b[s]%b slowread  %b[a]%b auto-lock' "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM")"
+    row "$(printf '%b[b]%b banlist  %b[u]%b unban  %b[e]%b edit  %b[r]%b reload  %b[5]%b auth-chk  %b[6]%b sweep  %b[h]%b ajuda  %b[q]%b sair' "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM" "$RST" "$DIM")"
+  fi
   printf '%s\033[K\n' "$BOT"
   printf '\033[J'
   if [ -n "$INTERACTIVE" ]; then
     if read -rsn1 -t 1 key; then
       case "$key" in
-        w|W) [ $((SECONDS - sent_at)) -ge 5 ] && send_snapshot ;;
+        w|W) [ $((SECONDS - sent_at)) -ge 5 ] && { send_snapshot; sent_at=$SECONDS; } ;;
+        p|P) toggle_panic ;;
+        l|L) toggle_lockdown ;;
+        s|S) toggle_slowread ;;
+        a|A) toggle_autolock ;;
+        b|B) banlist_show ;;
+        u|U) unban_prompt ;;
+        e|E) edit_config ;;
+        r|R) reload_all ;;
+        5)   show_authcheck ;;
+        6)   run_sweep ;;
+        h|H|'?') show_help ;;
         q|Q) cleanup ;;
       esac
     fi
@@ -744,7 +1169,6 @@ OTG_MON
 # otguard-lockdown — durante ataque, dropa SYN novos de IPs DESCONHECIDOS.
 # IPs que tiveram conexao ESTABLISHED nas portas do jogo nos ultimos
 # WHITELIST_SECS (default 3600s = 1h) estao no recent list "otg_players"
-# (populado pela regra mangle PREROUTING --set, via otguard-mitigacao.sh)
 # e PASSAM normalmente. Conexoes ja ESTABLISHED tambem nao sao afetadas
 # (regra "ctstate RELATED,ESTABLISHED -j ACCEPT" vem antes na chain).
 #
@@ -827,10 +1251,605 @@ case "${1:-}" in
 esac
 OTG_LOCK
 
+  cat > "$sd/otguard-panic" <<'OTG_PANIC'
+#!/bin/bash
+# otguard-panic — "stop responding" mode pra ataques globais.
+#
+# A regra: passou de PPS_PANIC pps total no eth0, o server PARA de responder
+# QUALQUER SYN novo nas portas do jogo. NAO ha whitelist aqui — diferente
+# do otguard-lockdown que deixa "IPs conhecidos" passarem, o panic DROPA
+# TUDO em raw PREROUTING (antes do conntrack), entao o kernel nem chega
+# a gerar SYN-ACK. ShieldM/scrubber upstream consegue identificar que
+# nao estamos respondendo e dropa o flood antes da nossa banda.
+#
+# Conexoes ja ESTABLISHED nao sao afetadas (regra so casa --syn).
+# Auto-acionado pelo otguard-live.sh quando pps > PPS_PANIC sustentado.
+# Auto-removido quando pps cai e fica baixo por PANIC_HOLD_SECS.
+#
+# uso:
+#   otguard-panic on        liga (drop SYN total em 7171/7172)
+#   otguard-panic off       desliga
+#   otguard-panic status    mostra estado
+
+set -e
+. /etc/otguard/otguard.conf 2>/dev/null
+PORTS_CSV="${PORTS_CSV:-7171,7172}"
+COMMENT="otg_panic"
+# Posicao na raw PREROUTING: depois do bypass loopback+admin (1,2), antes
+# da blocklist (3+). Garante drop mais barato possivel pra ataque.
+POS=3
+
+active() {
+  iptables -t raw -C PREROUTING -p tcp --syn -m multiport --dports "$PORTS_CSV" \
+    -m comment --comment "$COMMENT" -j DROP 2>/dev/null
+}
+
+case "${1:-}" in
+  on)
+    if active; then
+      echo "panic ja estava ATIVO"
+    else
+      iptables -t raw -I PREROUTING "$POS" -p tcp --syn -m multiport --dports "$PORTS_CSV" \
+        -m comment --comment "$COMMENT" -j DROP
+      logger -t otguard-panic "ATIVADO — todo SYN novo em $PORTS_CSV sera dropado em raw PREROUTING (sem SYN-ACK)"
+      echo "panic ATIVO — server nao responde mais novos SYN em $PORTS_CSV"
+    fi
+    ;;
+  off)
+    if active; then
+      iptables -t raw -D PREROUTING -p tcp --syn -m multiport --dports "$PORTS_CSV" \
+        -m comment --comment "$COMMENT" -j DROP
+      logger -t otguard-panic "DESATIVADO"
+      echo "panic DESATIVADO"
+    else
+      echo "panic ja estava inativo"
+    fi
+    ;;
+  status)
+    if active; then
+      echo "ATIVO"
+      iptables -t raw -L PREROUTING -n -v --line-numbers 2>/dev/null | grep -E "$COMMENT|^Chain" | head -3
+    else
+      echo "INATIVO"
+    fi
+    ;;
+  *)
+    echo "uso: $0 {on|off|status}"
+    echo "  on  — drop TOTAL de SYN novo em $PORTS_CSV (mesmo IPs conhecidos)"
+    echo "  off — remove o panic"
+    exit 1
+    ;;
+esac
+OTG_PANIC
+
+  cat > "$sd/otguard-slowread" <<'OTG_SLOWREAD'
+#!/bin/bash
+# otguard-slowread v2 — detector de slowread per-IP com janela rolante.
+#
+# v1 bug: deletava seen.<ip> a cada scan em que o IP nao aparecia como
+# suspeito. Atacante esperto contornava abrindo N conn, segurando ~30-45s
+# (abaixo do GRACE de 60s), fechando tudo e repetindo. O timer resetava.
+#
+# v2: para cada scan em que o IP eh suspeito, append do timestamp em
+# hits.<ip>. A cada ciclo poda entradas mais antigas que SLOWREAD_HITS_WINDOW.
+# Se o numero de hits dentro da janela >= SLOWREAD_BAN_HITS, bane.
+# Pega tanto sustentado quanto oscilador (3 reaparicoes em 30min = ban).
+#
+# Roda como daemon via systemd (otguard-slowread.service).
+
+set -e
+. /etc/otguard/otguard.conf 2>/dev/null
+PORTS_CSV="${PORTS_CSV:-7171,7172}"
+INTERVAL="${SLOWREAD_INTERVAL:-15}"
+MIN_CONNS="${SLOWREAD_MIN_CONNS:-5}"
+TOTAL_SENDQ="${SLOWREAD_TOTAL_SENDQ:-300}"
+WINDOW="${SLOWREAD_HITS_WINDOW:-1800}"
+BAN_HITS="${SLOWREAD_BAN_HITS:-3}"
+BAN_SECS="${SLOWREAD_BAN_SECS:-${BAN_SECS:-86400}}"
+LOG_ONLY="${SLOWREAD_LOG_ONLY:-nao}"
+
+STATE_DIR=/run/otguard/slowread
+mkdir -p "$STATE_DIR"
+
+pred=""
+IFS=','
+for p in $PORTS_CSV; do
+  [ -n "$pred" ] && pred="$pred or "
+  pred="${pred}sport = :$p"
+done
+unset IFS
+PORTS_PRED="( $pred )"
+
+if [ "$LOG_ONLY" = "sim" ]; then
+  logger -t otguard-slowread "armado v2 (janela rolante) MODO LOG-ONLY: >=${MIN_CONNS} conn + Send-Q total >=${TOTAL_SENDQ}B; ${BAN_HITS} hits/${WINDOW}s -> CANDIDATO"
+else
+  logger -t otguard-slowread "armado v2 (janela rolante): >=${MIN_CONNS} conn + Send-Q total >=${TOTAL_SENDQ}B; ${BAN_HITS} hits/${WINDOW}s -> ban ${BAN_SECS}s"
+fi
+
+while :; do
+  NOW=$(date +%s)
+  CUTOFF=$(( NOW - WINDOW ))
+
+  ss -tnH state established "$PORTS_PRED" 2>/dev/null | \
+    awk -v minc="$MIN_CONNS" -v mins="$TOTAL_SENDQ" '
+      {
+        peer = $4;
+        n = split(peer, a, ":");
+        ip = a[1];
+        for (i = 2; i < n; i++) ip = ip ":" a[i];
+        sumq[ip] += $2 + 0;
+        cnt[ip]++;
+      }
+      END {
+        for (ip in cnt) {
+          if (cnt[ip] >= minc && sumq[ip] >= mins) {
+            printf "%s %d %d\n", ip, cnt[ip], sumq[ip];
+          }
+        }
+      }' > "$STATE_DIR/current"
+
+  while IFS=' ' read -r ip conns sumq; do
+    [ -z "$ip" ] && continue
+    # Skip whitelist do conf (ADMIN_IPS, lista separada por espaco)
+    case " $ADMIN_IPS " in *" $ip "*) continue ;; esac
+    ipset test otguard_bl "$ip" 2>/dev/null && continue
+
+    f="$STATE_DIR/hits.$ip"
+    echo "$NOW $conns $sumq" >> "$f"
+    hits=$(awk -v cut="$CUTOFF" '$1 >= cut { n++ } END { print n+0 }' "$f")
+
+    if [ "$hits" -ge "$BAN_HITS" ]; then
+      if [ "$LOG_ONLY" = "sim" ]; then
+        logger -t otguard-slowread "CANDIDATO-A-BAN $ip — ${hits} hits/${WINDOW}s (atual: ${conns} conn, ${sumq}B) [LOG-ONLY]"
+      else
+        ipset add -exist otguard_bl "$ip" timeout "$BAN_SECS" 2>/dev/null
+        ipset save otguard_bl > /etc/otguard/blocklist.ipset 2>/dev/null
+        ss -K dst "$ip" >/dev/null 2>&1 || true
+        logger -t otguard-slowread "BANIDO $ip — slowread ciclico: ${hits} hits em ${WINDOW}s (atual: ${conns} conn, ${sumq}B Send-Q)"
+        rm -f "$f"
+      fi
+    elif [ "$hits" -eq 1 ]; then
+      logger -t otguard-slowread "suspeito $ip (${conns} conn, Send-Q total ${sumq}B) — 1/${BAN_HITS} hits, janela ${WINDOW}s"
+    else
+      logger -t otguard-slowread "suspeito $ip (${conns} conn, Send-Q total ${sumq}B) — ${hits}/${BAN_HITS} hits"
+    fi
+  done < "$STATE_DIR/current"
+
+  for f in "$STATE_DIR"/hits.*; do
+    [ -e "$f" ] || continue
+    awk -v cut="$CUTOFF" '$1 >= cut' "$f" > "$f.tmp" 2>/dev/null
+    if [ -s "$f.tmp" ]; then
+      mv -f "$f.tmp" "$f"
+    else
+      rm -f "$f.tmp" "$f"
+    fi
+  done
+
+  sleep "$INTERVAL"
+done
+OTG_SLOWREAD
+
+  cat > "$sd/otguard-shadow" <<'OTG_SHADOW'
+#!/bin/bash
+# otguard-shadow — ShieldM local: detector de padroes de attack via auth.log
+#
+# Le /var/log/otguard/auth.log (alimentado por hook em login.lua do TFS)
+# a cada SHADOW_INTERVAL e detecta:
+#
+# PADRAO A — char usado de muitos IPs (botnet usando 1 conta de acesso):
+#   - char autenticando de >= SHADOW_A_IPS_PER_CHAR IPs distintos / janela
+#   - Escala por level:
+#       lvl >= A_HIGH_LVL  : alerta amarelo Discord (NAO bane)
+#       lvl A_LOW..A_HIGH  : alerta amarelo (NAO bane sem confirm)
+#       lvl <  A_LOW_LVL   : BAN automatico de todos os IPs
+#
+# PADRAO B — IP com varios chars low-level (botnet stuffing throwaway):
+#   - IP com >= SHADOW_B_CHARS_PER_IP chars lvl <= SHADOW_B_LEVEL_MAX
+#   - SAFETY 1: mesmo IP tem char lvl >= SAFE_HIGH_LVL na janela? -> SKIP (casa MC legit)
+#   - SAFETY 2: alguma account envolvida tem char lvl >= DB_HIGH_LVL no DB? -> SKIP + alerta
+#   - Caso contrario: BAN o IP
+#
+# Alertas Discord usam DISCORD_WEBHOOK do otguard.conf.
+# DB queries usam sqlPass de /home/otserv/*/config.lua (configuravel via OTG_TFS_DIR).
+
+set -u
+. /etc/otguard/otguard.conf 2>/dev/null
+
+AUTH_LOG=/var/log/otguard/auth.log
+STATE_DIR=/run/otguard/shadow
+
+WINDOW="${SHADOW_WINDOW:-3600}"
+A_IPS="${SHADOW_A_IPS_PER_CHAR:-5}"
+A_HIGH_LVL="${SHADOW_A_HIGH_LVL:-300}"
+A_LOW_LVL="${SHADOW_A_LOW_LVL:-50}"
+B_CHARS="${SHADOW_B_CHARS_PER_IP:-5}"
+B_LVL_MAX="${SHADOW_B_LEVEL_MAX:-20}"
+SAFE_HIGH_LVL="${SHADOW_SAFE_HIGH_LVL:-50}"
+DB_HIGH_LVL="${SHADOW_DB_HIGH_LVL:-100}"
+INTERVAL="${SHADOW_INTERVAL:-60}"
+BAN_SECS="${SHADOW_BAN_SECS:-86400}"
+DISCORD="${DISCORD_WEBHOOK:-}"
+
+# Encontra config.lua do TFS (default: 1o em /home/otserv/*/config.lua)
+TFS_CFG="${OTG_TFS_CONFIG:-}"
+[ -z "$TFS_CFG" ] && TFS_CFG=$(ls /home/otserv/*/config.lua 2>/dev/null | head -1)
+DBPASS=""; DBNAME=""
+if [ -n "$TFS_CFG" ] && [ -f "$TFS_CFG" ]; then
+  DBPASS=$(grep -E "^[[:space:]]*sqlPass" "$TFS_CFG" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+  DBNAME=$(grep -E "^[[:space:]]*sqlDatabase" "$TFS_CFG" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+fi
+
+mkdir -p "$STATE_DIR"
+touch "$STATE_DIR/alerted_chars" "$STATE_DIR/alerted_ips"
+chmod 600 "$STATE_DIR/alerted_chars" "$STATE_DIR/alerted_ips"
+
+logger -t otguard-shadow "armado: A>=${A_IPS}IPs/char (low<${A_LOW_LVL}=ban, ${A_LOW_LVL}-${A_HIGH_LVL}=alerta, >=${A_HIGH_LVL}=alerta); B>=${B_CHARS}chars(lvl<=${B_LVL_MAX})/IP com safety(main lvl>=${SAFE_HIGH_LVL} | DB lvl>=${DB_HIGH_LVL}); scan=${INTERVAL}s"
+
+send_discord() {
+  local title="$1" desc="$2" color="${3:-15158332}"
+  [ -z "$DISCORD" ] && return 0
+  local payload
+  payload=$(printf '{"username":"OTGuard Shadow","embeds":[{"title":%s,"description":%s,"color":%d}]}' \
+    "$(printf '%s' "$title" | jq -Rs . 2>/dev/null || printf '"%s"' "$title")" \
+    "$(printf '%s' "$desc"  | jq -Rs . 2>/dev/null || printf '"%s"' "$desc")" \
+    "$color")
+  curl -s -m 5 -H "Content-Type: application/json" -d "$payload" "$DISCORD" >/dev/null 2>&1 || true
+}
+
+ban_ip_silent() {
+  local ip="$1" reason="$2"
+  ipset test otguard_bl "$ip" 2>/dev/null && return 0
+  ipset add -exist otguard_bl "$ip" timeout "$BAN_SECS" 2>/dev/null
+  ipset save otguard_bl > /etc/otguard/blocklist.ipset 2>/dev/null
+  ss -K dst "$ip" >/dev/null 2>&1 || true
+  logger -t otguard-shadow "BANIDO $ip — $reason"
+}
+
+# fail-safe: erro de DB ou ausencia retorna "tem main" (skip ban)
+account_has_high_lvl() {
+  local accid="$1" min_lvl="${2:-$DB_HIGH_LVL}"
+  [ -z "$DBPASS" ] && return 0
+  local n
+  n=$(mysql -u root -p"$DBPASS" "$DBNAME" -Nse "SELECT COUNT(*) FROM players WHERE account_id=$accid AND level>=$min_lvl" 2>/dev/null)
+  if [ -z "$n" ]; then
+    logger -t otguard-shadow "WARN: db query failed pra acc=$accid — assumindo legit (fail-safe)"
+    return 0
+  fi
+  [ "$n" -gt 0 ]
+}
+
+scan_pattern_A() {
+  local now="$1"
+  local cut=$(( now - WINDOW ))
+
+  awk -F'\t' -v cut="$cut" '$1 >= cut {print $3 "\t" $2 "\t" $5+0}' "$AUTH_LOG" | sort -u > "$STATE_DIR/a_rows.tmp"
+
+  awk -F'\t' '
+    { cnt[$1]++; if($3+0>(max[$1]+0)) max[$1]=$3+0; ips[$1]=(ips[$1]?ips[$1]","$2:$2) }
+    END { for(c in cnt) if(cnt[c]>='"$A_IPS"') printf "%s\t%d\t%d\t%s\n", c, cnt[c], max[c], ips[c] }
+  ' "$STATE_DIR/a_rows.tmp" | \
+  while IFS=$'\t' read -r char n maxlvl iplist; do
+    grep -qFx "$char" "$STATE_DIR/alerted_chars" && continue
+    echo "$char" >> "$STATE_DIR/alerted_chars"
+
+    if [ "$maxlvl" -ge "$A_HIGH_LVL" ]; then
+      logger -t otguard-shadow "PADRAO_A_HIGH: char=\"$char\" lvl=$maxlvl logou de $n IPs — alerta, NAO bane"
+      send_discord "⚠️ Char veterano com IP rotativo" "**Char:** $char (lvl $maxlvl)\\n**IPs:** $n distintos em ${WINDOW}s\\n$iplist\\n_NAO banido — revisar se conta roubada_" 16776960
+    elif [ "$maxlvl" -ge "$A_LOW_LVL" ]; then
+      logger -t otguard-shadow "PADRAO_A_MID: char=\"$char\" lvl=$maxlvl logou de $n IPs — alerta, requer confirm"
+      send_discord "⚠️ Padrão A mid-level (precisa review)" "**Char:** $char (lvl $maxlvl)\\n**IPs:** $n distintos\\n$iplist\\n_NAO banido sem confirmacao_" 16776960
+    else
+      logger -t otguard-shadow "PADRAO_A_LOW: char=\"$char\" lvl=$maxlvl logou de $n IPs — banindo todos"
+      send_discord "🚫 Padrão A (low-level): ban automático" "**Char:** $char (lvl $maxlvl)\\n**IPs banidos:** $n\\n$iplist" 15158332
+      IFS=',' read -ra arr <<< "$iplist"
+      for ip in "${arr[@]}"; do
+        [ -n "$ip" ] && ban_ip_silent "$ip" "padrao A: char $char lvl=$maxlvl usou $n IPs"
+      done
+    fi
+  done
+}
+
+scan_pattern_B() {
+  local now="$1"
+  local cut=$(( now - WINDOW ))
+
+  awk -F'\t' -v cut="$cut" '$1 >= cut {print $2 "\t" $3 "\t" $4 "\t" $5+0}' "$AUTH_LOG" | sort -u > "$STATE_DIR/b_rows.tmp"
+
+  awk -F'\t' -v maxlvl="$B_LVL_MAX" '
+    $4+0 <= maxlvl {
+      cnt[$1]++;
+      seen_acc[$1","$3]=1;
+      chars[$1] = (chars[$1] ? chars[$1] "|" $2 : $2)
+    }
+    END {
+      for(ip in cnt) if(cnt[ip] >= '"$B_CHARS"') {
+        accs = "";
+        for(k in seen_acc) {
+          split(k, a, ",");
+          if(a[1]==ip) accs = (accs ? accs "," a[2] : a[2]);
+        }
+        printf "%s\t%d\t%s\t%s\n", ip, cnt[ip], accs, chars[ip]
+      }
+    }
+  ' "$STATE_DIR/b_rows.tmp" | \
+  while IFS=$'\t' read -r ip n acclist charlist; do
+    grep -qFx "$ip" "$STATE_DIR/alerted_ips" && continue
+
+    local has_high
+    has_high=$(awk -F'\t' -v ip="$ip" -v safe="$SAFE_HIGH_LVL" 'BEGIN{n=0} $1==ip && $4+0>=safe {n++} END{print n}' "$STATE_DIR/b_rows.tmp")
+    if [ "${has_high:-0}" -gt 0 ]; then
+      logger -t otguard-shadow "PADRAO_B_SKIP_safety1: ip=$ip tem $n chars low + $has_high char(s) lvl>=$SAFE_HIGH_LVL (casa MC) — NAO bane"
+      echo "$ip" >> "$STATE_DIR/alerted_ips"
+      continue
+    fi
+
+    local legit_acc=""
+    IFS=',' read -ra accs_arr <<< "$acclist"
+    for acc in "${accs_arr[@]}"; do
+      [ -z "$acc" ] && continue
+      if account_has_high_lvl "$acc" "$DB_HIGH_LVL"; then
+        legit_acc="$acc"
+        break
+      fi
+    done
+
+    if [ -n "$legit_acc" ]; then
+      logger -t otguard-shadow "PADRAO_B_SKIP_safety2: ip=$ip mas acc $legit_acc tem char lvl>=$DB_HIGH_LVL no DB — NAO bane"
+      send_discord "🟨 Padrão B com main no DB (não banido)" "IP \`$ip\` com $n chars low-level.\\n**Account** \`$legit_acc\` tem char lvl>=$DB_HIGH_LVL no DB.\\n_Pode ser farmer legit ou conta comprometida._" 16776960
+      echo "$ip" >> "$STATE_DIR/alerted_ips"
+      continue
+    fi
+
+    echo "$ip" >> "$STATE_DIR/alerted_ips"
+    logger -t otguard-shadow "PADRAO_B: ip=$ip teve $n chars low-level (accs=$acclist) sem main — BAN"
+    send_discord "🚫 Padrão B: ban automático" "**IP:** \`$ip\`\\n**Chars low-level:** $n\\n**Chars:** $charlist\\n**Accounts:** $acclist\\n_Nenhuma com main detectado_" 15158332
+    ban_ip_silent "$ip" "padrao B: $n chars lvl<=$B_LVL_MAX accs=$acclist"
+  done
+}
+
+while :; do
+  NOW=$(date +%s)
+  if [ -f "$AUTH_LOG" ]; then
+    scan_pattern_A "$NOW"
+    scan_pattern_B "$NOW"
+  fi
+  sleep "$INTERVAL"
+done
+OTG_SHADOW
+
+  cat > "$bd/otguard-auth-check" <<'OTG_AUTHCHECK'
+#!/bin/bash
+# otguard-auth-check — analisa /var/log/otguard/auth.log e cruza com conn ESTAB.
+# Schema auth.log (tab-separated): ts ip name accid level voc os
+#
+# Uso: otguard-auth-check [janela_secs]   default 1800 (30min)
+
+set -e
+. /etc/otguard/otguard.conf 2>/dev/null
+PORTS_CSV="${PORTS_CSV:-7171,7172}"
+AUTH_LOG=/var/log/otguard/auth.log
+WINDOW="${1:-1800}"
+LOWLVL_MAX="${2:-20}"
+MIN_IPS_PER_CHAR=3
+MIN_CHARS_PER_IP=3
+
+[ -f "$AUTH_LOG" ] || { echo "ERRO: $AUTH_LOG nao existe"; exit 1; }
+
+NOW=$(date +%s)
+CUT=$(( NOW - WINDOW ))
+
+pred=""
+IFS=','; for p in $PORTS_CSV; do
+  [ -n "$pred" ] && pred="$pred or "
+  pred="${pred}sport = :$p"
+done; unset IFS
+PORTS_PRED="( $pred )"
+
+TMP=$(mktemp -d)
+trap "rm -rf $TMP" EXIT
+
+awk -F'\t' -v cut="$CUT" '$1 >= cut {print}' "$AUTH_LOG" > "$TMP/auth_window"
+N_LOGINS=$(wc -l < "$TMP/auth_window")
+
+awk -F'\t' '{print $2}' "$TMP/auth_window" | sort -u > "$TMP/auth_ips"
+N_AUTH_IPS=$(wc -l < "$TMP/auth_ips")
+
+ss -tnH state established "$PORTS_PRED" 2>/dev/null | \
+  awk '{n=split($4,a,":"); ip=a[1]; for(i=2;i<n;i++) ip=ip":"a[i]; print ip}' | \
+  sort -u > "$TMP/conn_ips"
+N_CONN=$(wc -l < "$TMP/conn_ips")
+
+comm -23 "$TMP/conn_ips" "$TMP/auth_ips" > "$TMP/suspect_ips"
+N_SUSPECT=$(wc -l < "$TMP/suspect_ips")
+
+comm -12 "$TMP/conn_ips" "$TMP/auth_ips" > "$TMP/legit_ips"
+N_LEGIT=$(wc -l < "$TMP/legit_ips")
+
+echo "============================================================"
+echo "OTGuard Auth-Check  janela=${WINDOW}s  low_lvl=<=${LOWLVL_MAX}"
+echo "============================================================"
+printf "Logins na janela        : %d\n" "$N_LOGINS"
+printf "IPs unicos autenticados : %d\n" "$N_AUTH_IPS"
+printf "IPs com conn ESTAB agora: %d\n" "$N_CONN"
+printf "Legit (auth + conn)     : %d\n" "$N_LEGIT"
+printf "Suspeitos (conn s/ auth): %d\n" "$N_SUSPECT"
+pct=0; [ "$N_CONN" -gt 0 ] && pct=$(( N_LEGIT * 100 / N_CONN ))
+printf "Cobertura auth/conn     : %d%%\n" "$pct"
+
+echo
+echo "=== Distribuicao de level (logins na janela) ==="
+awk -F'\t' '{
+  lvl=$5+0;
+  if(lvl<=10) c1++;
+  else if(lvl<=30) c2++;
+  else if(lvl<=100) c3++;
+  else if(lvl<=300) c4++;
+  else c5++;
+  tot++
+} END {
+  if(tot==0){print "(sem dados)"; exit}
+  printf "  lvl 1-10  : %d (%d%%)  <- bot/farmar IP\n", c1, c1*100/tot
+  printf "  lvl 11-30 : %d (%d%%)\n", c2, c2*100/tot
+  printf "  lvl 31-100: %d (%d%%)\n", c3, c3*100/tot
+  printf "  lvl 101-300:%d (%d%%)\n", c4, c4*100/tot
+  printf "  lvl 300+  : %d (%d%%)\n", c5, c5*100/tot
+}' "$TMP/auth_window"
+
+echo
+echo "=== Distribuicao de OS do client (logins na janela) ==="
+awk -F'\t' '{print $7}' "$TMP/auth_window" | sort | uniq -c | sort -rn | \
+  awk '{
+    os=$2+0;
+    name="?"
+    if(os==0)name="WIN_TIBIA"
+    else if(os==1)name="GTK"
+    else if(os==2)name="OSX"
+    else if(os==10)name="OTCLIENT_LIN"
+    else if(os==11)name="OTCLIENT_WIN"
+    else if(os==12)name="OTCLIENT_MAC"
+    else if(os==20)name="OTCLIENT_AND"
+    else if(os>=100)name="CUSTOM/SUSPEITO"
+    printf "  %-20s code=%d  count=%d\n", name, os, $1
+  }'
+
+echo
+echo "=== PADRAO A: chars com >=${MIN_IPS_PER_CHAR} IPs distintos ==="
+awk -F'\t' '{print $3"\t"$2}' "$TMP/auth_window" | sort -u | \
+  awk -F'\t' '{cnt[$1]++} END{for(c in cnt) if(cnt[c]>='"$MIN_IPS_PER_CHAR"') print cnt[c]"\t"c}' | \
+  sort -rn | head -20 | awk -F'\t' '{printf "  %3d IPs   char=\"%s\"\n", $1, $2}'
+
+echo
+echo "=== PADRAO B: IPs com >=${MIN_CHARS_PER_IP} chars distintos ==="
+awk -F'\t' '{print $2"\t"$3"\t"$5}' "$TMP/auth_window" | sort -u | \
+  awk -F'\t' '
+    {chars[$1]++; lvls[$1]+=$3; minlvl[$1]=(minlvl[$1]==""||$3<minlvl[$1])?$3:minlvl[$1]; maxlvl[$1]=(maxlvl[$1]==""||$3>maxlvl[$1])?$3:maxlvl[$1]}
+    END {
+      for(ip in chars) if(chars[ip]>='"$MIN_CHARS_PER_IP"')
+        printf "%d\t%s\tchars=%d  lvls=%d..%d  avg=%.0f\n", chars[ip], ip, chars[ip], minlvl[ip], maxlvl[ip], lvls[ip]/chars[ip]
+    }' | sort -rn | head -20 | awk -F'\t' '{print "  "$2"  "$3}'
+
+echo
+echo "=== TOP 15 SUSPEITOS (conn ESTAB sem auth na janela) ==="
+[ -s "$TMP/suspect_ips" ] && while read ip; do
+  nconn=$(ss -tnH state established "$PORTS_PRED" 2>/dev/null | \
+    awk -v ip="$ip" '{n=split($4,a,":"); pip=a[1]; for(i=2;i<n;i++) pip=pip":"a[i]; if(pip==ip) c++} END{print c+0}')
+  printf "%d\t%s\n" "$nconn" "$ip"
+done < "$TMP/suspect_ips" | sort -rn | head -15 | awk -F'\t' '{printf "  %s  %d conn\n", $2, $1}'
+
+echo
+echo "(rode com janela maior pra mais sinal: otguard-auth-check 7200)"
+OTG_AUTHCHECK
+
+  cat > "$sd/otguard-unban-watcher" <<'OTG_UNBAN'
+#!/bin/bash
+# otguard-unban-watcher — processa pedidos self-service de desban via DB.
+#
+# Pollagem da tabela otguard_unban_requests onde status='pending'.
+# Pro cada pedido valido:
+#   - rate limit: max UNBAN_MAX_PER_HOUR/h e _PER_DAY/dia por account
+#   - IP precisa estar atualmente no otguard_bl
+#   - aceita: ipset del + status=done + log + Discord
+#   - rejeita: status=rejected + reason
+#
+# Asimetria contra atacante: legit loga no site (auth com conta valida) e
+# clica unban. Atacante teria que fazer isso por IP — escala impossivel
+# pra botnet de centenas de IPs.
+
+set -u
+. /etc/otguard/otguard.conf 2>/dev/null
+
+INTERVAL="${UNBAN_INTERVAL:-30}"
+MAX_PER_HOUR="${UNBAN_MAX_PER_HOUR:-1}"
+MAX_PER_DAY="${UNBAN_MAX_PER_DAY:-5}"
+DISCORD="${DISCORD_WEBHOOK:-}"
+
+TFS_CFG="${OTG_TFS_CONFIG:-}"
+[ -z "$TFS_CFG" ] && TFS_CFG=$(ls /home/otserv/*/config.lua 2>/dev/null | head -1)
+DBPASS=""; DBNAME=""
+if [ -n "$TFS_CFG" ] && [ -f "$TFS_CFG" ]; then
+  DBPASS=$(grep -E "^[[:space:]]*sqlPass" "$TFS_CFG" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+  DBNAME=$(grep -E "^[[:space:]]*sqlDatabase" "$TFS_CFG" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+fi
+
+if [ -z "$DBPASS" ] || [ -z "$DBNAME" ]; then
+  logger -t otguard-unban "ERRO: sem credenciais DB (config.lua nao encontrado)"
+  exit 1
+fi
+
+logger -t otguard-unban "armado: poll ${INTERVAL}s, rate=${MAX_PER_HOUR}/h ${MAX_PER_DAY}/dia por account"
+
+send_discord() {
+  local title="$1" desc="$2" color="${3:-3066993}"
+  [ -z "$DISCORD" ] && return 0
+  local payload
+  payload=$(printf '{"username":"OTGuard Unban","embeds":[{"title":%s,"description":%s,"color":%d}]}' \
+    "$(printf '%s' "$title" | jq -Rs . 2>/dev/null || printf '"%s"' "$title")" \
+    "$(printf '%s' "$desc"  | jq -Rs . 2>/dev/null || printf '"%s"' "$desc")" \
+    "$color")
+  curl -s -m 5 -H "Content-Type: application/json" -d "$payload" "$DISCORD" >/dev/null 2>&1 || true
+}
+
+mysql_q() {
+  mysql -u root -p"$DBPASS" "$DBNAME" -Nse "$1" 2>/dev/null
+}
+mysql_x() {
+  mysql -u root -p"$DBPASS" "$DBNAME" -e "$1" 2>/dev/null
+}
+
+reject() {
+  local id="$1" reason="$2"
+  mysql_x "UPDATE otguard_unban_requests SET status='rejected', reason='$(printf '%s' "$reason" | sed "s/'/''/g")', processed_at=UNIX_TIMESTAMP() WHERE id=$id"
+  logger -t otguard-unban "REJEITADO request#$id — $reason"
+}
+
+while :; do
+  pending=$(mysql_q "SELECT CONCAT_WS('|', id, account_id, IFNULL(account_name,''), ip, IFNULL(remote_ip,'')) FROM otguard_unban_requests WHERE status='pending' ORDER BY id LIMIT 50")
+
+  while IFS='|' read -r id accid accname ip remote_ip; do
+    [ -z "$id" ] && continue
+
+    if ! printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+      reject "$id" "IP invalido: $ip"
+      continue
+    fi
+
+    hour_count=$(mysql_q "SELECT COUNT(*) FROM otguard_unban_requests WHERE account_id=$accid AND status='done' AND processed_at > UNIX_TIMESTAMP() - 3600")
+    if [ "${hour_count:-0}" -ge "$MAX_PER_HOUR" ]; then
+      reject "$id" "rate limit: ${MAX_PER_HOUR}/h excedido"
+      continue
+    fi
+
+    day_count=$(mysql_q "SELECT COUNT(*) FROM otguard_unban_requests WHERE account_id=$accid AND status='done' AND processed_at > UNIX_TIMESTAMP() - 86400")
+    if [ "${day_count:-0}" -ge "$MAX_PER_DAY" ]; then
+      reject "$id" "rate limit: ${MAX_PER_DAY}/dia excedido"
+      continue
+    fi
+
+    if ! ipset test otguard_bl "$ip" 2>/dev/null; then
+      reject "$id" "IP nao esta na blocklist"
+      continue
+    fi
+
+    if ipset del otguard_bl "$ip" 2>/dev/null; then
+      ipset save otguard_bl > /etc/otguard/blocklist.ipset 2>/dev/null
+      mysql_x "UPDATE otguard_unban_requests SET status='done', processed_at=UNIX_TIMESTAMP() WHERE id=$id"
+      logger -t otguard-unban "UNBAN $ip (account=$accname id=$accid request=$id remote=$remote_ip)"
+      send_discord "🔓 Self-service unban" "**IP:** \`$ip\`\\n**Account:** $accname (id=$accid)\\n**Remote (site):** $remote_ip\\n**Request:** #$id" 3066993
+    else
+      reject "$id" "ipset del falhou"
+    fi
+  done <<< "$pending"
+
+  sleep "$INTERVAL"
+done
+OTG_UNBAN
+
   # substitui placeholders dependentes da versao em runtime (heredoc 'quoted' nao expande)
   sed -i "s/__OTG_VER__/$OTG_VER/g" "$bd/otguard-mon"
   chmod +x "$sd/otguard-mitigacao.sh" "$sd/otguard-cf-update.sh" "$sd/otguard-watch.sh" \
-           "$sd/otguard-live.sh" "$sd/otguard-lockdown" "$bd/otguard-mon"
+           "$sd/otguard-live.sh" "$sd/otguard-lockdown" "$sd/otguard-panic" \
+           "$sd/otguard-slowread" "$sd/otguard-shadow" "$sd/otguard-unban-watcher" \
+           "$bd/otguard-mon" "$bd/otguard-auth-check"
 }
 
 emit_units() {
@@ -874,6 +1893,62 @@ Nice=10
 [Install]
 WantedBy=multi-user.target
 OTG_U3
+
+  cat > /etc/systemd/system/otguard-slowread.service <<'OTG_USL'
+[Unit]
+Description=OTGuard: detector de slowread (sockets idle drenando recursos)
+After=network-online.target otguard-mitigacao.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/otguard-slowread
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+OTG_USL
+  cat > /etc/systemd/system/otguard-shadow.service <<'OTG_USHA'
+[Unit]
+Description=OTGuard Shadow: ShieldM local + auto-ban via auth.log
+After=network.target mysql.service mariadb.service
+Wants=mysql.service mariadb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/otguard-shadow
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+OTG_USHA
+  cat > /etc/systemd/system/otguard-unban.service <<'OTG_UUNB'
+[Unit]
+Description=OTGuard Unban: processa pedidos self-service de desban
+After=network.target mysql.service mariadb.service
+Wants=mysql.service mariadb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/otguard-unban-watcher
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+OTG_UUNB
+  cat > /etc/tmpfiles.d/otguard.conf <<'OTG_TMPF'
+d /var/log/otguard 0755 root root -
+f /var/log/otguard/auth.log 0666 root root -
+OTG_TMPF
+  systemd-tmpfiles --create /etc/tmpfiles.d/otguard.conf 2>/dev/null || true
   cat > /etc/systemd/system/otguard-cfupdate.service <<'OTG_U4'
 [Unit]
 Description=OTGuard: atualiza os ranges da Cloudflare
@@ -924,12 +1999,38 @@ OTG_SYS
   emit_units
   systemctl daemon-reload
   ok "componentes e units instalados"
-  for s in otguard-mitigacao otguard-watch otguard-live; do
+  for s in otguard-mitigacao otguard-watch otguard-live otguard-slowread otguard-shadow otguard-unban; do
     say "  ${CD}subindo $s ...${CR}"
     systemctl enable "$s" >/dev/null 2>&1
     systemctl restart "$s"
   done
   ok "servicos no ar"
+  # Cria schema do self-service unban se TFS configurado (idempotente)
+  _tfs_cfg="${OTG_TFS_CONFIG:-$(ls /home/otserv/*/config.lua 2>/dev/null | head -1)}"
+  if [ -n "$_tfs_cfg" ] && [ -f "$_tfs_cfg" ]; then
+    _dbpass=$(grep -E "^[[:space:]]*sqlPass" "$_tfs_cfg" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+    _dbname=$(grep -E "^[[:space:]]*sqlDatabase" "$_tfs_cfg" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+    if [ -n "$_dbpass" ] && [ -n "$_dbname" ]; then
+      mysql -u root -p"$_dbpass" "$_dbname" -e "
+        CREATE TABLE IF NOT EXISTS otguard_unban_requests (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          account_id INT NOT NULL,
+          account_name VARCHAR(64) DEFAULT NULL,
+          ip VARCHAR(45) NOT NULL,
+          remote_ip VARCHAR(45) DEFAULT NULL,
+          requested_at INT NOT NULL,
+          processed_at INT DEFAULT NULL,
+          status ENUM('pending','done','rejected') DEFAULT 'pending',
+          reason VARCHAR(255) DEFAULT NULL,
+          INDEX idx_status_id (status, id),
+          INDEX idx_account_time (account_id, requested_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;" 2>/dev/null \
+        && ok "tabela otguard_unban_requests garantida (DB $_dbname)" \
+        || warn "nao consegui criar tabela otguard_unban_requests no DB $_dbname"
+    fi
+  else
+    warn "TFS config.lua nao encontrado — self-service unban precisa de hook no PHP (ver README) + tabela criada manualmente"
+  fi
   if grep -q '^CF_FILTER=sim' "$CONF" 2>/dev/null; then
     systemctl enable --now otguard-cfupdate.timer >/dev/null 2>&1
     ok "filtragem Cloudflare ativada"
@@ -971,7 +2072,7 @@ status() {
   say ""
   say "  ${CT}OTGuard $OTG_VER${CR}  ·  $PROVIDER_NAME  ·  portas $PORTS"
   hr
-  for s in otguard-mitigacao otguard-watch otguard-live; do
+  for s in otguard-mitigacao otguard-watch otguard-live otguard-slowread; do
     en=$(systemctl is-enabled "$s" 2>/dev/null)
     ac=$(systemctl is-active  "$s" 2>/dev/null)
     if [ "$ac" = active ]; then ok "$s  ($en / $ac)"; else err "$s  ($en / $ac)"; fi
@@ -994,7 +2095,7 @@ helper() {
   say ""
   say "  ${CT}OTGuard $OTG_VER${CR}  ·  $PROVIDER_NAME  ·  portas $PORTS"
   hr
-  for s in otguard-mitigacao otguard-watch otguard-live; do
+  for s in otguard-mitigacao otguard-watch otguard-live otguard-slowread; do
     ac=$(systemctl is-active "$s" 2>/dev/null)
     if [ "$ac" = active ]; then ok "$s"; else err "$s ($ac)"; fi
   done
@@ -1106,7 +2207,7 @@ banlist() {
 uninstall() {
   ask "remover OTGuard por completo?" "n"
   case $ANS in s|S|y|Y) ;; *) say "  cancelado."; exit 0;; esac
-  for s in otguard-mitigacao otguard-watch otguard-live; do
+  for s in otguard-mitigacao otguard-watch otguard-live otguard-slowread otguard-shadow otguard-unban; do
     systemctl disable --now "$s" >/dev/null 2>&1
     rm -f "/etc/systemd/system/$s.service"
   done
@@ -1123,11 +2224,21 @@ uninstall() {
   ipset destroy otguard_cf6 2>/dev/null
   # garante que lockdown nao fique pendurado no iptables ao remover
   [ -x /usr/local/sbin/otguard-lockdown ] && /usr/local/sbin/otguard-lockdown off >/dev/null 2>&1 || true
+  [ -x /usr/local/sbin/otguard-panic    ] && /usr/local/sbin/otguard-panic    off >/dev/null 2>&1 || true
+  systemctl stop otguard-slowread >/dev/null 2>&1 || true
+  rm -rf /run/otguard
   systemctl stop otguard-lockdown-autoff.timer otguard-lockdown-autoff.service >/dev/null 2>&1 || true
   rm -f /usr/local/sbin/otguard-mitigacao.sh /usr/local/sbin/otguard-cf-update.sh \
         /usr/local/sbin/otguard-watch.sh /usr/local/sbin/otguard-live.sh \
-        /usr/local/sbin/otguard-lockdown \
-        /usr/local/bin/otguard-mon /etc/sysctl.d/99-otguard.conf \
+        /usr/local/sbin/otguard-lockdown /usr/local/sbin/otguard-panic \
+        /usr/local/sbin/otguard-slowread /usr/local/sbin/otguard-shadow \
+        /usr/local/sbin/otguard-unban-watcher \
+        /etc/systemd/system/otguard-slowread.service \
+        /etc/systemd/system/otguard-shadow.service \
+        /etc/systemd/system/otguard-unban.service \
+        /etc/tmpfiles.d/otguard.conf \
+        /usr/local/bin/otguard-mon /usr/local/bin/otguard-auth-check \
+        /etc/sysctl.d/99-otguard.conf \
         /usr/local/bin/otguard /usr/local/sbin/otguard
   rm -rf "$CONF_DIR"
   ok "OTGuard removido.  (logs em $LOGDIR foram mantidos)"
@@ -1143,6 +2254,11 @@ selftest() {
   if command -v bash >/dev/null 2>&1; then
     if bash -n "$d/otguard-mon" 2>/dev/null; then ok "otguard-mon"; else err "otguard-mon — erro"; fail=1; fi
     if bash -n "$d/otguard-lockdown" 2>/dev/null; then ok "otguard-lockdown"; else err "otguard-lockdown — erro"; fail=1; fi
+    if bash -n "$d/otguard-panic" 2>/dev/null; then ok "otguard-panic"; else err "otguard-panic — erro"; fail=1; fi
+    if bash -n "$d/otguard-slowread" 2>/dev/null; then ok "otguard-slowread"; else err "otguard-slowread — erro"; fail=1; fi
+    if bash -n "$d/otguard-shadow" 2>/dev/null; then ok "otguard-shadow"; else err "otguard-shadow — erro"; fail=1; fi
+    if bash -n "$d/otguard-unban-watcher" 2>/dev/null; then ok "otguard-unban-watcher"; else err "otguard-unban-watcher — erro"; fail=1; fi
+    if bash -n "$d/otguard-auth-check" 2>/dev/null; then ok "otguard-auth-check"; else err "otguard-auth-check — erro"; fail=1; fi
   else warn "bash ausente — otguard-mon/otguard-lockdown nao checados"; fi
   rm -rf "$d"
   say ""
@@ -1261,7 +2377,7 @@ POST
 set -e
 case "$1" in
   remove|upgrade|deconfigure)
-    for s in otguard-watch otguard-live otguard-mitigacao otguard-cfupdate.timer; do
+    for s in otguard-watch otguard-live otguard-slowread otguard-mitigacao otguard-cfupdate.timer; do
       systemctl is-enabled "$s" >/dev/null 2>&1 && systemctl disable --now "$s" >/dev/null 2>&1 || true
     done
     ;;

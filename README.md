@@ -132,6 +132,149 @@ git push origin main v1.1
 # o Actions builda o .deb e cria a Release automaticamente
 ```
 
+## OTGuard Shadow (auto-ban via auth.log)
+
+A partir de 1.7 o OTGuard inclui um daemon `otguard-shadow` que detecta padrões de attack via login de personagem. Ele depende de UM hook Lua no seu TFS (não vem instalado por default porque o caminho depende do seu server).
+
+### Hook do TFS — adicione ao final do seu `onLogin(cid)` em `data/creaturescripts/scripts/login.lua` (antes do `return true`):
+
+```lua
+-- otguard-shadow: log persistente de cada login autenticado.
+-- Tab-separated. Campos: ts ip nome accid level voc os
+pcall(function()
+    local f = io.open("/var/log/otguard/auth.log", "a")
+    if f then
+        f:write(string.format("%d\t%s\t%s\t%d\t%d\t%d\t%d\n",
+            os.time(),
+            doConvertIntegerToIp(getPlayerIp(cid)),
+            getPlayerName(cid),
+            getPlayerAccountId(cid),
+            getPlayerLevel(cid),
+            getPlayerVocation(cid),
+            getPlayerOperatingSystem(cid)))
+        f:close()
+    end
+end)
+```
+
+Depois faça `/reload creaturescripts` no chat do jogo (god/admin). Sem o hook, o `auth.log` fica vazio e o daemon shadow não tem como detectar nada.
+
+### Como funciona
+
+| componente | o que faz |
+|---|---|
+| **hook login.lua** | a cada login real escreve `timestamp IP char accid level voc os` em `/var/log/otguard/auth.log` |
+| **otguard-shadow** (daemon) | a cada 60s analisa últimos 1h e bana automaticamente: char com 5+ IPs distintos (lvl<50) ou IP com 5+ chars lvl≤20 (com safety: skip se IP tem main lvl≥50 na janela, ou se algum account tem main lvl≥100 no DB) |
+| **otguard-auth-check** | script CLI: `otguard-auth-check 3600` mostra cobertura auth/conn + distribuição de level + padrões A/B |
+| **`otguard mon` [5]** | painel inline do auth-check (janela 2h) |
+| **`otguard mon` [6]** | sweep manual 24h: lista candidatos, pede confirmação, bana em massa + alerta Discord agregado |
+
+Tunable via `/etc/otguard/otguard.conf` (chaves `SHADOW_*`). Os defaults são conservadores (5 IPs/char, 5 chars/IP, ban 24h).
+
+## Self-service unban (assimetria contra atacante)
+
+A partir de 1.7 o OTGuard inclui `otguard-unban` — daemon que processa pedidos de desban feitos pelo jogador no site (via `accountmanagement.php`). A ideia:
+
+- Jogador legit toma ban injusto durante ataque → loga no site (auth da conta dele) → vê os IPs dele → clica "Solicitar desban" → daemon processa em até 30s
+- Atacante NÃO escala: pra desbanir N IPs do botnet, precisaria logar uma conta válida pra cada IP, abrir o accountmanagement, pedir o desban — friction enorme
+
+A tabela `otguard_unban_requests` é criada automaticamente no apply se o TFS for detectado em `/home/otserv/*/config.lua` (ou aponte com `OTG_TFS_CONFIG` no conf).
+
+### Hook no PHP (myaac)
+
+Adicione ao seu `pages/accountmanagement.php`, logo antes do bloco `//########### CHANGE PASSWORD ##########`:
+
+```php
+//########### OTGUARD: SELF-SERVICE UNBAN ##########
+if($action == "unbanip")
+{
+    $accId = (int)$account_logged->getId();
+    $accName = $account_logged->getName();
+    $remoteIp = $_SERVER['REMOTE_ADDR'] ?? '';
+    $db = Website::getDBHandle();
+
+    // Coleta IPs historicos da conta (lastip de cada char + IP atual da sessao)
+    $ips = [];
+    if(filter_var($remoteIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $ips[$remoteIp] = 'IP atual (sessão web)';
+    }
+    try {
+        $r = $db->query("SELECT name, INET_NTOA(lastip) AS ip FROM players WHERE account_id = $accId AND lastip > 0");
+        while($row = $r->fetch()) {
+            if($row['ip'] && !isset($ips[$row['ip']])) {
+                $ips[$row['ip']] = 'último login de ' . htmlspecialchars($row['name']);
+            }
+        }
+    } catch(Exception $e) {}
+
+    // Le blocklist do otguard
+    $bl = [];
+    if(is_readable('/etc/otguard/blocklist.ipset')) {
+        foreach(file('/etc/otguard/blocklist.ipset') as $line) {
+            if(preg_match('/^add\s+otguard_bl\s+(\S+)/', $line, $m)) $bl[$m[1]] = true;
+        }
+    }
+
+    // POST: solicita desban
+    $msg = '';
+    if(isset($_POST['unban_ip'])) {
+        $reqIp = trim($_POST['unban_ip']);
+        if(!filter_var($reqIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $msg = '<font color=red>IP inválido.</font>';
+        elseif(!isset($ips[$reqIp])) $msg = '<font color=red>IP não pertence à sua conta.</font>';
+        elseif(!isset($bl[$reqIp])) $msg = '<font color=orange>IP não está banido.</font>';
+        else {
+            $now = time();
+            $rl = $db->query("SELECT COUNT(*) AS n FROM otguard_unban_requests WHERE account_id=$accId AND requested_at > ".($now-3600))->fetch();
+            if(($rl['n'] ?? 0) >= 1) $msg = '<font color=red>Você já fez um pedido na última hora.</font>';
+            else {
+                $db->query("INSERT INTO otguard_unban_requests (account_id, account_name, ip, remote_ip, requested_at, status) VALUES ($accId, ".$db->quote($accName).", ".$db->quote($reqIp).", ".$db->quote($remoteIp).", $now, 'pending')");
+                $msg = '<font color=green>Pedido enviado. Processado em até 30s.</font>';
+            }
+        }
+    }
+
+    // Renderiza tabela com IPs + botão
+    $rows = '';
+    foreach($ips as $ip => $origem) {
+        $ipEsc = htmlspecialchars($ip);
+        if(isset($bl[$ip])) {
+            $rows .= '<tr><td>'.$ipEsc.'</td><td>'.htmlspecialchars($origem).'</td><td><font color=red><b>BANIDO</b></font></td><td><form method=post action="?subtopic=accountmanagement&action=unbanip" style=margin:0><input type=hidden name=unban_ip value="'.$ipEsc.'"><input type=submit value="Solicitar desban" onclick="return confirm(\'Confirma desban?\')"></form></td></tr>';
+        } else {
+            $rows .= '<tr><td>'.$ipEsc.'</td><td>'.htmlspecialchars($origem).'</td><td><font color=green>OK</font></td><td>—</td></tr>';
+        }
+    }
+
+    $main_content .= '<div class="TableContainer"><table class="Table1"><tr><td><div class="InnerTableContainer">'
+        .($msg ? '<p style=text-align:center>'.$msg.'</p>' : '')
+        .'<p>Limite: 1 pedido por hora, 5 por dia.</p>'
+        .'<table style=width:100% border=1 cellpadding=4><tr><th>IP</th><th>Origem</th><th>Status</th><th>Ação</th></tr>'.$rows.'</table>'
+        .'</div></td></tr></table></div>';
+}
+```
+
+E opcionalmente adicione um link na action `"manage"` (logo após o fechamento `</tr><br/>';`):
+
+```php
+$main_content .= '<p style="text-align:center;padding:10px"><a href="?subtopic=accountmanagement&action=unbanip" style="color:#cc0000;font-weight:bold">⚠️ Gerenciar IPs banidos (OTGuard)</a></p>';
+```
+
+### Configuração (em `/etc/otguard/otguard.conf`)
+
+```
+UNBAN_INTERVAL=30          # poll a cada 30s
+UNBAN_MAX_PER_HOUR=1       # max desbans por account por hora
+UNBAN_MAX_PER_DAY=5        # max desbans por account por dia
+```
+
+### Como o ban é decidido vs desbanido
+
+| ação | quem decide |
+|---|---|
+| **ban automático** | otguard (slowread/shadow): thresholds em tempo real |
+| **ban manual** | admin via `otguard ban <ip>` ou `[6]` sweep |
+| **unban automático** | jogador no site → daemon valida + executa |
+| **unban manual** | admin via `otguard unban <ip>` ou `[u]` no mon |
+
 ## Estrutura do repo
 
 ```
